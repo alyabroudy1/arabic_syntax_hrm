@@ -1,0 +1,36 @@
+# ============================================
+# Arabic Syntax HRM - Python Dependencies
+# ============================================
+
+# Core ML
+torch>=2.2.0
+transformers>=4.40.0
+datasets>=3.0.0
+accelerate>=0.30.0
+numpy>=1.26.0
+
+# Quantization & LoRA (GPU training only)
+# bitsandbytes>=0.44.0
+# peft>=0.13.0
+# trl>=0.11.0
+# unsloth
+
+# Arabic NLP
+# camel-tools  # heavy dependency, install separately if needed
+
+# Export
+onnx>=1.16.0
+onnxruntime>=1.18.0
+
+# Data Processing
+sentencepiece
+protobuf
+
+# Experiment tracking
+# wandb
+
+# Testing
+pytest>=8.0.0
+
+# Utilities
+tqdm

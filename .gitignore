@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Large data and models
+data/
+models/
+llama.cpp/
+
+# macOS
+.DS_Store
+
+# Pytest
+.pytest_cache/

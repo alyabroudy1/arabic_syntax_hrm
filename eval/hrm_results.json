@@ -1,0 +1,28 @@
+{
+  "model_path": "/Users/mohammad/AndroidStudioProjects/arabic_syntax_hrm/models/hrm_arabic_syntax/best_hrm.pt",
+  "test_size": 304,
+  "metrics": {
+    "case_accuracy": 0.8342985241920419,
+    "UAS": 0.28376611246030264,
+    "deprel_accuracy": 0.7029702970297029,
+    "LAS": 0.21838221558004858
+  },
+  "config": {
+    "grid_rows": 32,
+    "grid_cols": 8,
+    "vocab_size": 512,
+    "hidden_dim": 128,
+    "manager_dim": 64,
+    "worker_dim": 64,
+    "embed_dim": 32,
+    "manager_steps": 4,
+    "worker_steps": 2,
+    "epochs": 92,
+    "batch_size": 64,
+    "lr": 0.001,
+    "best_dev_acc": 0.5962,
+    "best_dev_loss": 2.1998,
+    "num_params": 2346278,
+    "device": "mps"
+  }
+}
