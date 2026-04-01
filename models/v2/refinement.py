@@ -46,16 +46,16 @@ class TreeMessagePassingLayer(nn.Module):
         head_msg, _ = self.head_attention(H, head_repr, head_repr, need_weights=False)
         
         # ── 2. Downward (children) message ──
-        child_sum = torch.zeros_like(H)
-        child_count = torch.zeros(B, N, 1, device=device)
-        
+        # Vectorized child aggregation using scatter_add_ (replaces O(B×N) Python loop)
         head_idx_flat = pred_heads.clamp(0, N-1)
-        for b in range(B):
-            length = mask[b].sum().item()
-            for d in range(1, length):
-                h = head_idx_flat[b, d].item()
-                child_sum[b, h] += H[b, d]
-                child_count[b, h] += 1
+        head_idx_expanded = head_idx_flat.unsqueeze(-1).expand(-1, -1, D)  # (B, N, D)
+        
+        # Scatter each word's representation to its head position
+        child_sum = torch.zeros_like(H).scatter_add_(1, head_idx_expanded, H)
+        child_count = torch.zeros(B, N, 1, device=device).scatter_add_(
+            1, head_idx_flat.unsqueeze(-1),
+            mask.float().unsqueeze(-1)  # only count real tokens
+        )
         
         child_avg = child_sum / child_count.clamp(min=1)
         child_msg = self.child_transform(torch.cat([H, child_avg], dim=-1))
@@ -183,67 +183,43 @@ class SecondOrderScorer(nn.Module):
     def extract_gold_pairs(self, gold_heads, mask):
         B, N = gold_heads.shape
         device = gold_heads.device
-        all_sib_h, all_sib_i, all_sib_j = [], [], []
-        all_gp_g, all_gp_h, all_gp_d = [], [], []
         
-        from collections import defaultdict
+        # === Vectorized Grandparents ===
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+        gp_h = gold_heads.clamp(0, N-1)
+        gp_g = gold_heads[batch_idx, gp_h].clamp(0, N-1)
+        gp_d = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
         
-        for b in range(B):
-            length = mask[b].sum().item()
-            heads = gold_heads[b, :length]
-            
-            children = defaultdict(list)
-            for d in range(1, length):
-                h = heads[d].item()
-                children[h].append(d)
-            
-            sib_h, sib_i, sib_j = [], [], []
-            for h, deps in children.items():
-                for idx_a in range(len(deps)):
-                    for idx_b in range(idx_a + 1, len(deps)):
-                        sib_h.append(h)
-                        sib_i.append(deps[idx_a])
-                        sib_j.append(deps[idx_b])
-            
-            all_sib_h.append(sib_h)
-            all_sib_i.append(sib_i)
-            all_sib_j.append(sib_j)
-            
-            gp_g, gp_h, gp_d = [], [], []
-            for d in range(1, length):
-                h = heads[d].item()
-                if 0 < h < length:  # non root and valid index
-                    g = heads[h].item()
-                    gp_g.append(g)
-                    gp_h.append(h)
-                    gp_d.append(d)
-            
-            all_gp_g.append(gp_g)
-            all_gp_h.append(gp_h)
-            all_gp_d.append(gp_d)
+        # Valid GP mask: token is real, token is not root (d>0), head is not root (h>0)
+        # Note: h < length is covered by mask on h
+        h_is_valid = mask.gather(1, gp_h)
+        gp_mask = mask.bool() & (gp_d > 0) & (gp_h > 0) & h_is_valid.bool()
         
-        def pad_lists(list_of_lists, pad_val=0):
-            max_k = max(len(l) for l in list_of_lists) if list_of_lists else 1
-            max_k = max(max_k, 1)
-            padded = torch.full((B, max_k), pad_val, dtype=torch.long, device=device)
-            pair_mask = torch.zeros(B, max_k, dtype=torch.bool, device=device)
-            for b, l in enumerate(list_of_lists):
-                if l:
-                    padded[b, :len(l)] = torch.tensor(l, device=device)
-                    pair_mask[b, :len(l)] = True
-            return padded, pair_mask
+        # === Vectorized Siblings ===
+        # Siblings: pairs of dependencies (i, j) that share the same head
+        heads_exp_i = gold_heads.unsqueeze(2).expand(B, N, N)
+        heads_exp_j = gold_heads.unsqueeze(1).expand(B, N, N)
         
-        sib_h_t, sib_mask = pad_lists(all_sib_h)
-        sib_i_t, _ = pad_lists(all_sib_i)
-        sib_j_t, _ = pad_lists(all_sib_j)
+        same_head = (heads_exp_i == heads_exp_j)
         
-        gp_g_t, gp_mask = pad_lists(all_gp_g)
-        gp_h_t, _ = pad_lists(all_gp_h)
-        gp_d_t, _ = pad_lists(all_gp_d)
+        i_idx = torch.arange(N, device=device).unsqueeze(0).unsqueeze(2).expand(B, N, N)
+        j_idx = torch.arange(N, device=device).unsqueeze(0).unsqueeze(1).expand(B, N, N)
+        
+        sib_h = heads_exp_i
+        
+        valid_i = mask.bool().unsqueeze(2).expand(B, N, N) & (i_idx > 0)
+        valid_j = mask.bool().unsqueeze(1).expand(B, N, N)
+        sib_mask = same_head & (i_idx < j_idx) & valid_i & valid_j
+        
+        # Flatten the spatial dimensions to shape (B, K) for the gathered embeddings
+        sib_h_flat = sib_h.reshape(B, N*N)
+        sib_i_flat = i_idx.reshape(B, N*N)
+        sib_j_flat = j_idx.reshape(B, N*N)
+        sib_mask_flat = sib_mask.reshape(B, N*N)
         
         return {
-            'sib': (sib_h_t, sib_i_t, sib_j_t, sib_mask),
-            'gp': (gp_g_t, gp_h_t, gp_d_t, gp_mask),
+            'sib': (sib_h_flat, sib_i_flat, sib_j_flat, sib_mask_flat),
+            'gp': (gp_g, gp_h, gp_d, gp_mask),
         }
     
     def second_order_loss(self, H, gold_heads, pred_heads, mask):

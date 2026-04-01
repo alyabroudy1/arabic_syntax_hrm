@@ -128,7 +128,7 @@ class ArabicMorphologicalEncoder(nn.Module):
         bpe_emb = self.bpe_embed(bpe_ids)  # (B, W, n_pieces, 128)
         bpe_mask = (bpe_ids != 0).float().unsqueeze(-1)
         # Avoid max over empty seq by clamping mask to very small
-        bpe_out = (bpe_emb * bpe_mask + (1 - bpe_mask) * -1e9).max(dim=2).values
+        bpe_out = (bpe_emb * bpe_mask + (1 - bpe_mask) * -1e4).max(dim=2).values
         bpe_out = self.bpe_proj(bpe_out)
         bpe_out = bpe_out.masked_fill((bpe_ids.sum(dim=-1) == 0).unsqueeze(-1), 0.0)
         

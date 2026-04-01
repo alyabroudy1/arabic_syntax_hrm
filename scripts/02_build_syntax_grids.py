@@ -134,7 +134,7 @@ def encode_agreement(feats: Dict[str, str]) -> int:
     return g * 12 + n * 3 + p
 
 
-def word_to_bucket(word: str, num_buckets: int = 256) -> int:
+def word_to_bucket(word: str, num_buckets: int = 8192) -> int:
     """Hash word form to a fixed bucket (0 to num_buckets-1)."""
     # Use a simple but deterministic hash
     h = 0

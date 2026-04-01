@@ -20,8 +20,8 @@ class DifferentiableTreeCRF(nn.Module):
         B, N, _ = arc_scores.shape
         device = arc_scores.device
         
-        # Exp to get potentials
-        potentials = torch.exp(arc_scores)  # (B, N, N)
+        # Exp to get potentials (Clamp logits up to +20 to prevent Inf exponentiation causing NaN)
+        potentials = torch.exp(arc_scores.clamp(max=20.0, min=-20.0))  # (B, N, N)
         
         # Apply mask
         mask_2d = mask.unsqueeze(1) & mask.unsqueeze(2)  # (B, N, N)
@@ -30,33 +30,21 @@ class DifferentiableTreeCRF(nn.Module):
         potentials = potentials * mask_2d.float()
         
         # Build Laplacian L (B, N-1, N-1), we drop the root node 0
-        # L_{i,j} = \sum_k A_{k,j} if i==j, else -A_{i,j}
-        # Note: A_{h, d} = potentials[:, h, d]
-        # We need the Laplacian of the submatrix for vertices 1..N-1
-        
         A = potentials[:, 1:, 1:]  # (B, N-1, N-1)
         root_A = potentials[:, 0, 1:]  # (B, N-1)
         
-        # In-degree of each non-root node: sum of incoming edges from ALL nodes (including root)
-        # incoming from non-root:
         in_degree = A.sum(dim=1)  # (B, N-1)
-        # total incoming:
         total_in_degree = in_degree + root_A  # (B, N-1)
         
-        # Laplacian L
         L = torch.diag_embed(total_in_degree) - A  # (B, N-1, N-1)
         
-        # For variable length sentences, we must modify the Laplacian so that
-        # padded nodes act as identity matrices (to not affect the determinant/logdet)
-        pad_mask = ~mask[:, 1:].bool()  # (B, N-1), True for padding
+        # For variable length sentences, replace padded submatrix with Identity Matrix
+        pad_mask = ~mask[:, 1:].bool()  # (B, N-1)
+        pad_mask_2d = pad_mask.unsqueeze(1) | pad_mask.unsqueeze(2)  # (B, N-1, N-1)
         
-        # Replace padded rows/cols with 1 on diagonal, 0 elsewhere
-        for b in range(B):
-            pm = pad_mask[b]
-            if pm.any():
-                L[b, pm, :] = 0.0
-                L[b, :, pm] = 0.0
-                L[b, pm, pm] = 1.0  # diagonal 1
+        # Vectorized: set padded rows/cols to 0.0, then add 1.0 to the diagonal for padded elements
+        L = L.masked_fill(pad_mask_2d, 0.0)
+        L = L + torch.diag_embed(pad_mask.float())
                 
         # log Z = log det(L)
         # For numerical stability, we use slogdet
@@ -64,15 +52,21 @@ class DifferentiableTreeCRF(nn.Module):
         # Handled cases where determinant is non-positive due to bad potentials
         logZ = torch.where(sign > 0, logdet, torch.zeros_like(logdet))
         
-        # Score of gold tree
-        gold_mask = torch.zeros_like(arc_scores, dtype=torch.bool)
-        gold_mask.scatter_(1, gold_heads.clamp(min=0).unsqueeze(1), True)
-        gold_mask = gold_mask & mask_2d
+        # Score of gold tree: arc_scores[b, gold_heads[b,d], d] for each dependent d
+        dep_idx = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # (B, N)
+        gold_heads_clamped = gold_heads.clamp(0, N-1)
         
-        gold_score = (arc_scores * gold_mask.float()).sum(dim=(1, 2))
+        # Gold score for each (batch, dep) pair
+        gold_arc_scores = arc_scores[batch_idx, gold_heads_clamped, dep_idx]  # (B, N)
         
-        # NLL Loss: log Z - score(gold)
-        loss = (logZ - gold_score).mean()
+        # Mask: only count real dependents (not root position 0, not padding)
+        dep_mask = mask.clone()
+        dep_mask[:, 0] = 0  # root is not a dependent
+        gold_score = (gold_arc_scores * dep_mask.float()).sum(dim=-1)  # (B,)
+        
+        # NLL Loss: log Z - score(gold), clamped for stability
+        loss = (logZ - gold_score).clamp(min=0.0).mean()
         return loss
 
 class ContrastiveTreeLoss(nn.Module):

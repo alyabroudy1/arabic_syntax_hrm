@@ -61,7 +61,7 @@ class VariationalTreeManager(nn.Module):
     
     def _attention_pool(self, H, mask):
         scores = self.pool_attention(H).squeeze(-1)  # (B, N)
-        scores = scores.masked_fill(~mask.bool(), -1e9)
+        scores = scores.masked_fill(~mask.bool(), -1e4)
         weights = torch.softmax(scores, dim=-1)      # (B, N)
         pooled = torch.bmm(weights.unsqueeze(1), H).squeeze(1)  # (B, D)
         return pooled

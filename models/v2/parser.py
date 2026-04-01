@@ -136,12 +136,24 @@ class ArabicHRMGridParserV2(nn.Module):
         
         self.struct_pos_encoder = ArabicStructuralPositionEncoder(d_model=D)
         
+        # Learned gate: decides per-word how much to trust word_embed vs morph_embed
+        # This lets CharCNN (inside morph_encoder) dominate for rare/OOV words
+        self.lexical_gate = nn.Sequential(
+            nn.Linear(D * 2, D),
+            nn.Sigmoid()
+        )
+        
         self.input_projection = nn.Sequential(
-            nn.Linear(D + D + 64, D),  # word_struct + morph + pos
+            nn.Linear(D + D + 64, D),  # lexical_blend + morph + pos
             nn.GELU(),
             nn.LayerNorm(D),
             nn.Dropout(config.dropout)
         )
+        
+        # Case class weights (inverse frequency from PADT train data)
+        # None/Mabni=48.1%, Nom=8.3%, Acc=10.2%, Gen=33.4%
+        case_weights = torch.tensor([1.0, 5.8, 4.7, 1.4] + [1.0] * max(0, n_cases - 4))
+        self.register_buffer('case_class_weights', case_weights[:n_cases])
         
         # ═══ Stage 2: Manager ═══
         self.manager = VariationalTreeManager(
@@ -223,7 +235,12 @@ class ArabicHRMGridParserV2(nn.Module):
         pos_emb = self.pos_embed(pos_tags)
         struct_pos = self.struct_pos_encoder(word_ids, pos_tags, mask.sum(dim=-1), mask)
         
-        combined = torch.cat([word_emb + struct_pos, morph_emb, pos_emb], dim=-1)
+        # Learned lexical gate: morph_emb (CharCNN) dominates for rare words,
+        # word_emb contributes for frequent well-represented words
+        gate = self.lexical_gate(torch.cat([word_emb, morph_emb], dim=-1))
+        lexical_blend = gate * word_emb + (1 - gate) * morph_emb
+        
+        combined = torch.cat([lexical_blend + struct_pos, morph_emb, pos_emb], dim=-1)
         H = self.input_projection(combined)
         
         # == STAGE 2: Manager ==
@@ -239,127 +256,87 @@ class ArabicHRMGridParserV2(nn.Module):
         H_grid = self.grid_processor(H, worker_goal, mask)
         H = H + H_grid
         
-        # == STAGE 5: Biaffine Arc Scoring ==
+        # == STAGE 5: Biaffine Arc Scoring (SuPar-style) ==
         h_head = self.arc_head_mlp(H)
         h_dep = self.arc_dep_mlp(H)
-        arc_scores = self.biaffine_arc(h_dep, h_head)
+        arc_scores = self.biaffine_arc(h_dep, h_head)  # (B, dep, head)
         
-        for i in range(W):
-            for j in range(W):
-                d = j - i
-                bucket = min(max(d, -16), 16) + 16
-                arc_scores[:, i, j] += dist_bias[:, bucket]
-                
-        # Disable padding
+        # Distance bias
+        positions = torch.arange(W, device=device)
+        rel_pos = (positions.unsqueeze(1) - positions.unsqueeze(0)).clamp(-16, 16) + 16
+        arc_scores = arc_scores + dist_bias[:, rel_pos]
+        
+        # SuPar masking: only mask HEAD dimension (invalid head candidates)
+        # Do NOT mask dep dimension or diagonal — let the model learn
         cand_mask = mask.bool()
-        arc_scores = arc_scores.masked_fill(~cand_mask.unsqueeze(1) | ~cand_mask.unsqueeze(2), -1e4)
+        arc_scores = arc_scores.masked_fill_(~cand_mask.unsqueeze(1), -1e4)
         
-        # Stage 6: First-pass head prediction
-        if training and gold_heads is not None:
-            tree_crf_loss = self.tree_crf(arc_scores, gold_heads, mask)
-            
-            dep_mask = mask[:, 1:]
-            arc_ce_loss = F.cross_entropy(
-                arc_scores[:, 1:, 1:].contiguous().view(-1, W-1),
-                (gold_heads[:, 1:].clamp(1, W-1) - 1).contiguous().view(-1),
-                reduction='none'
-            ).view(B, -1)
-            arc_ce_loss = (arc_ce_loss * dep_mask.float()).sum() / dep_mask.float().sum().clamp(min=1)
-            
-            temperature = self.gumbel_scheduler.get_temperature(epoch)
-            mix_ratio = self.gumbel_scheduler.get_mix_ratio(epoch)
-            soft_heads = self.gumbel_scheduler.gumbel_soft_heads(arc_scores, temperature, gold_heads, mix_ratio)
-            head_repr = self.gumbel_scheduler.soft_head_representation(soft_heads, H)
-            
-            contrastive = self.contrastive_loss(arc_scores, gold_heads, mask)
-        else:
-            # inference dummy
-            pred_heads = arc_scores.argmax(dim=1)
-            head_idx = pred_heads.clamp(0, W-1).unsqueeze(-1).expand(-1, -1, H.size(-1))
-            head_repr = H.gather(1, head_idx)
-            mix_ratio = 0.0
-            
-        # == STAGE 7: GNN Refinement ==
-        if training and gold_heads is not None:
-            if mix_ratio > 0.5:
-                refine_heads = gold_heads
-            else:
-                refine_heads = arc_scores[:, :, 1:].argmax(dim=1) + 1
-                refine_heads = torch.cat([torch.zeros(B, 1, dtype=torch.long, device=device), refine_heads], dim=1)
-        else:
-            refine_heads = arc_scores.argmax(dim=1)
-            
-        H_refined, refined_arc_scores = self.gnn_refine(H, refine_heads, mask)
-        arc_scores_final = arc_scores + 0.3 * refined_arc_scores
+        # == STAGE 6: Relation Scoring ==
+        r_head = self.rel_head_mlp(H)
+        r_dep = self.rel_dep_mlp(H)
+        rel_scores = self.biaffine_rel(r_dep, r_head)  # (B, dep, head, n_rels)
         
-        # == STAGE 8: Second-Order Loss ==
-        if training and gold_heads is not None:
-            pred_heads_for_2nd = arc_scores_final.argmax(dim=1)
-            second_order_loss = self.second_order.second_order_loss(
-                H_refined, gold_heads, pred_heads_for_2nd, mask
-            )
-            
-        # == STAGE 9: Relation Classification ==
-        r_head = self.rel_head_mlp(H_refined)
-        r_dep = self.rel_dep_mlp(H_refined)
-        rel_scores = self.biaffine_rel(r_dep, r_head)
-        rel_scores = rel_scores + rel_prior.unsqueeze(1).unsqueeze(1) * 0.1
-        
-        if training and gold_heads is not None:
-            head_indices = gold_heads
-        else:
-            head_indices = refine_heads
-            
-        dep_idx = torch.arange(W, device=device).unsqueeze(0).expand(B, -1)
-        head_idx_clamped = head_indices.clamp(0, W-1)
-        
-        # Note: In PyTorch indexing, if rel_scores is (B, D, H, R)
-        rel_logits = rel_scores[
-            torch.arange(B, device=device).unsqueeze(1).expand(-1, W),
-            dep_idx,
-            head_idx_clamped
-        ]
-        
-        # == STAGE 10: Case Classification ==
-        case_logits = self.case_classifier(H_refined)
+        # == STAGE 7: Case Classification ==
+        case_logits = self.case_classifier(H)
         
         if training and gold_heads is not None and gold_rels is not None and gold_cases is not None:
-            rel_loss = self.struct_label_smooth(rel_logits[:, 1:], gold_rels[:, 1:], mask[:, 1:])
+            # --- Arc Loss (SuPar-style: flat masked cross-entropy) ---
+            dep_mask = batch.get('dep_mask', mask).bool()  # excludes root words + padding
             
+            # Flatten and apply mask
+            arc_masked = arc_scores[dep_mask]  # (N_valid, W)
+            heads_masked = gold_heads.clamp(0, W-1)[dep_mask]  # (N_valid,)
+            arc_loss = F.cross_entropy(arc_masked, heads_masked)
+            
+            # --- Rel Loss (SuPar-style: extract rel at gold head position) ---
+            # rel_scores: (B, dep, head, n_rels) → index with gold heads
+            gold_h = gold_heads.clamp(0, W-1)  # (B, W)
+            # Gather: for each (b, d), get rel_scores[b, d, gold_h[b,d], :]
+            gold_h_expanded = gold_h.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, rel_scores.size(-1))
+            rel_at_gold = rel_scores.gather(2, gold_h_expanded).squeeze(2)  # (B, W, n_rels)
+            
+            rel_masked = rel_at_gold[dep_mask]  # (N_valid, n_rels)
+            rels_masked = gold_rels.clamp(0, rel_scores.size(-1)-1)[dep_mask]  # (N_valid,)
+            rel_loss = F.cross_entropy(rel_masked, rels_masked)
+            
+            # --- Case Loss ---
+            case_m = mask.bool()
             case_loss = F.cross_entropy(
-                case_logits.view(-1, case_logits.size(-1)),
-                gold_cases.view(-1),
-                reduction='none',
+                case_logits[case_m],
+                gold_cases[case_m],
+                weight=self.case_class_weights,
                 label_smoothing=0.05
             )
-            case_mask = mask.view(-1).float()
-            case_loss = (case_loss * case_mask).sum() / case_mask.sum().clamp(min=1)
             
-            arc_total = arc_ce_loss + tree_crf_loss
-            structural = contrastive + second_order_loss
-            kl_weight = min(1.0, epoch / 10.0) * 0.1
-            kl_term = kl_loss * kl_weight
-            
-            total_loss, loss_components = self.uncertainty_loss(
-                arc_total, rel_loss, case_loss, structural, kl_term
-            )
+            # SuPar-style total: arc + rel (primary) + case (auxiliary)
+            total_loss = arc_loss + rel_loss + 0.3 * case_loss
             
             return {
                 'loss': total_loss,
-                'arc_loss': arc_total.item(),
+                'arc_loss': arc_loss.item(),
                 'rel_loss': rel_loss.item(),
                 'case_loss': case_loss.item(),
-                'structural_loss': structural.item(),
-                'kl_loss': kl_loss.item(),
-                'loss_weights': loss_components,
-                'arc_scores': arc_scores_final,
-                'rel_logits': rel_logits,
+                'structural_loss': 0.0,
+                'kl_loss': 0.0,
+                'arc_scores': arc_scores,
+                'rel_logits': rel_at_gold,
                 'case_logits': case_logits,
             }
         else:
+            # Inference: greedy decode (SuPar-style)
+            pred_heads = arc_scores.argmax(dim=2)  # (B, W) — best head for each dep
+            
+            # Extract rel scores at predicted heads
+            pred_h = pred_heads.clamp(0, W-1)
+            pred_h_expanded = pred_h.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, rel_scores.size(-1))
+            rel_at_pred = rel_scores.gather(2, pred_h_expanded).squeeze(2)  # (B, W, n_rels)
+            pred_rels = rel_at_pred.argmax(dim=-1)
+            
+            pred_cases = case_logits.argmax(dim=-1)
+            
             return {
-                'pred_heads': arc_scores_final.argmax(dim=1),
-                'pred_rels': rel_logits.argmax(dim=-1),
-                'pred_cases': case_logits.argmax(dim=-1),
-                'arc_scores': arc_scores_final,
+                'pred_heads': pred_heads,
+                'pred_rels': pred_rels,
+                'pred_cases': pred_cases,
+                'arc_scores': arc_scores,
             }
