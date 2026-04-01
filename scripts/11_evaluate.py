@@ -42,6 +42,8 @@ def evaluate_split(model, split_name, data_dir, device):
     total_case = 0
     total_dep = 0
     total_tok = 0
+    total_diac_correct = 0
+    total_diac_chars = 0
     
     model.eval()
     with torch.no_grad():
@@ -51,6 +53,7 @@ def evaluate_split(model, split_name, data_dir, device):
             pred_heads = out['pred_heads']
             pred_rels = out['pred_rels']
             pred_cases = out['pred_cases']
+            pred_diacs = out.get('pred_diacs')
             
             gold_heads = batch['heads']
             gold_rels = batch['relations']
@@ -63,13 +66,22 @@ def evaluate_split(model, split_name, data_dir, device):
             total_case += ((pred_cases == gold_cases) & m).sum().item()
             total_dep += dm.sum().item()
             total_tok += m.sum().item()
+            
+            # Diac accuracy
+            diac_mask = batch.get('diac_mask')
+            diac_labels = batch.get('diac_labels')
+            if pred_diacs is not None and diac_mask is not None and diac_labels is not None:
+                dm2 = diac_mask.bool()
+                total_diac_correct += ((pred_diacs == diac_labels) & dm2).sum().item()
+                total_diac_chars += dm2.sum().item()
     
     uas = total_head / max(total_dep, 1) * 100
     las = total_las / max(total_dep, 1) * 100
     case = total_case / max(total_tok, 1) * 100
+    diac = total_diac_correct / max(total_diac_chars, 1) * 100
     
     return {
-        'uas': uas, 'las': las, 'case': case,
+        'uas': uas, 'las': las, 'case': case, 'diac': diac,
         'n_sentences': len(dataset), 'n_tokens': total_tok, 'n_deps': total_dep
     }
 
@@ -105,6 +117,7 @@ def main():
         print(f"  UAS:       {metrics['uas']:.2f}%")
         print(f"  LAS:       {metrics['las']:.2f}%")
         print(f"  Case:      {metrics['case']:.2f}%")
+        print(f"  Diac:      {metrics['diac']:.2f}%")
     
     print(f"\n{'='*60}")
 

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # Modules from v2 package
 from .encoders import ArabicMorphologicalEncoder, ArabicStructuralPositionEncoder, StackedTransformerEncoder
@@ -91,8 +92,86 @@ class BiaffineScorer(nn.Module):
             b = b + bu + bv + self.bias
         return b.squeeze(-1) if self.num_labels == 1 else b
 
+class IntegratedDiacHead(nn.Module):
+    """Diacritization head integrated into the HRM parser.
+    
+    Uses the parser's contextual word representations (syntax-aware)
+    + char BiLSTM for per-character diacritic prediction.
+    
+    Key advantage: syntax context → better case diacritics.
+    e.g. nsubj → nominative → ضمة, obj → accusative → فتحة
+    """
+    
+    def __init__(self, word_dim=384, char_hidden=128, n_diac_classes=15,
+                 max_chars=16, dropout=0.3):
+        super().__init__()
+        self.n_diac_classes = n_diac_classes
+        self.max_chars = max_chars
+        
+        # Char BiLSTM for local character patterns
+        self.char_embed = nn.Embedding(300, 64, padding_idx=0)
+        self.char_bilstm = nn.LSTM(
+            64, char_hidden, batch_first=True,
+            bidirectional=True, num_layers=1, dropout=0
+        )
+        
+        # Project word context to char space
+        self.context_proj = nn.Linear(word_dim, char_hidden * 2)
+        
+        # Classifier: char features + word context → diacritic
+        self.classifier = nn.Sequential(
+            nn.Linear(char_hidden * 4, char_hidden * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(char_hidden * 2, n_diac_classes),
+        )
+    
+    def forward(self, word_repr, char_ids, diac_labels=None, diac_mask=None):
+        """
+        Args:
+            word_repr: (B, W, D) — parser's contextual H
+            char_ids: (B, W, C) — character IDs
+            diac_labels: (B, W, C) — gold diacritic labels
+            diac_mask: (B, W, C) — valid chars mask
+        """
+        B, W, D = word_repr.shape
+        C = char_ids.shape[2] if char_ids.dim() == 3 else self.max_chars
+        
+        # Char BiLSTM
+        chars_flat = char_ids.view(B * W, C)
+        char_emb = self.char_embed(chars_flat)
+        char_out, _ = self.char_bilstm(char_emb)  # (B*W, C, hidden*2)
+        char_features = char_out.view(B, W, C, -1)  # (B, W, C, 256)
+        
+        # Broadcast word context to char level
+        context_proj = self.context_proj(word_repr)  # (B, W, 256)
+        context_expanded = context_proj.unsqueeze(2).expand(-1, -1, C, -1)
+        
+        # Combine and classify
+        combined = torch.cat([char_features, context_expanded], dim=-1)  # (B, W, C, 512)
+        diac_logits = self.classifier(combined)  # (B, W, C, 15)
+        
+        output = {
+            'diac_logits': diac_logits,
+            'pred_diacs': diac_logits.argmax(dim=-1),
+        }
+        
+        if diac_labels is not None and diac_mask is not None:
+            mask_flat = diac_mask.view(-1).bool()
+            if mask_flat.any():
+                logits_flat = diac_logits.view(-1, self.n_diac_classes)
+                labels_flat = diac_labels.view(-1)
+                output['loss'] = F.cross_entropy(
+                    logits_flat[mask_flat], labels_flat[mask_flat]
+                )
+            else:
+                output['loss'] = torch.tensor(0.0, device=word_repr.device)
+        
+        return output
+
 
 class ParserConfig:
+
     def __init__(self, **kwargs):
         self.word_vocab = kwargs.get('word_vocab', 10000)
         self.char_vocab = kwargs.get('char_vocab', 300)
@@ -200,6 +279,15 @@ class ArabicHRMGridParserV2(nn.Module):
             nn.Linear(D // 2, n_cases)
         )
         
+        # ═══ Stage 11: Diacritization Head ═══
+        self.diac_head = IntegratedDiacHead(
+            word_dim=D,
+            char_hidden=128,
+            n_diac_classes=15,
+            max_chars=16,
+            dropout=config.dropout,
+        )
+        
         # ═══ More Losses ═══
         self.uncertainty_loss = UncertaintyWeightedMultiTaskLoss(n_tasks=5)
         self.contrastive_loss = ContrastiveTreeLoss(n_negatives=4, margin=2.0)
@@ -279,6 +367,14 @@ class ArabicHRMGridParserV2(nn.Module):
         # == STAGE 7: Case Classification ==
         case_logits = self.case_classifier(H)
         
+        # == STAGE 8: Diacritization ==
+        diac_out = self.diac_head(
+            word_repr=H,
+            char_ids=char_ids,
+            diac_labels=batch.get('diac_labels'),
+            diac_mask=batch.get('diac_mask'),
+        )
+        
         if training and gold_heads is not None and gold_rels is not None and gold_cases is not None:
             # --- Arc Loss (SuPar-style: flat masked cross-entropy) ---
             dep_mask = batch.get('dep_mask', mask).bool()  # excludes root words + padding
@@ -308,19 +404,22 @@ class ArabicHRMGridParserV2(nn.Module):
                 label_smoothing=0.05
             )
             
-            # SuPar-style total: arc + rel (primary) + case (auxiliary)
-            total_loss = arc_loss + rel_loss + 0.3 * case_loss
+            # SuPar-style total: arc + rel (primary) + case + diac (auxiliary)
+            diac_loss = diac_out.get('loss', torch.tensor(0.0, device=device))
+            total_loss = arc_loss + rel_loss + 0.3 * case_loss + 0.3 * diac_loss
             
             return {
                 'loss': total_loss,
                 'arc_loss': arc_loss.item(),
                 'rel_loss': rel_loss.item(),
                 'case_loss': case_loss.item(),
+                'diac_loss': diac_loss.item() if torch.is_tensor(diac_loss) else 0.0,
                 'structural_loss': 0.0,
                 'kl_loss': 0.0,
                 'arc_scores': arc_scores,
                 'rel_logits': rel_at_gold,
                 'case_logits': case_logits,
+                'diac_logits': diac_out.get('diac_logits'),
             }
         else:
             # Inference: greedy decode (SuPar-style)
@@ -338,5 +437,6 @@ class ArabicHRMGridParserV2(nn.Module):
                 'pred_heads': pred_heads,
                 'pred_rels': pred_rels,
                 'pred_cases': pred_cases,
+                'pred_diacs': diac_out.get('pred_diacs'),
                 'arc_scores': arc_scores,
             }

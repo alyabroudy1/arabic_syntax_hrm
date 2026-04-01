@@ -260,15 +260,16 @@ class RealArabicV2Dataset(Dataset):
             words += [""] * (max_len - len(words))  # padding
             
             c_row, b_row, r_row, p_row = [], [], [], []
+            MAX_CHARS = 16
             for w in words:
                 if not w:
-                    c_row.append([0]*8)
+                    c_row.append([0]*MAX_CHARS)
                     b_row.append([0]*4)
                     r_row.append(0)
                     p_row.append(0)
                     continue
                     
-                chars = [ord(c)%300 for c in w[:8]] + [0]*max(0, 8-len(w))
+                chars = [ord(c)%300 for c in w[:MAX_CHARS]] + [0]*max(0, MAX_CHARS-len(w))
                 bpes = [(stable_hash(w, 8000))]*4
                 c_row.append(chars)
                 b_row.append(bpes)
@@ -292,6 +293,92 @@ class RealArabicV2Dataset(Dataset):
         self.bpe_ids_cache = torch.tensor(self.bpe_ids_cache, device='cpu').clamp(0, 7999)
         self.root_ids_cache = torch.tensor(self.root_ids_cache, device='cpu')
         self.pattern_ids_cache = torch.tensor(self.pattern_ids_cache, device='cpu')
+        
+        # ── Load diacritization labels from PADT Vform ──
+        self.diac_labels_cache, self.diac_mask_cache = self._load_diac_labels(data_dir, split, max_len)
+    
+    def _load_diac_labels(self, data_dir, split, max_len):
+        """Load per-character diac labels from PADT CoNLL-U Vform."""
+        PADT_DIR = data_dir.parent / 'ud_arabic_padt'
+        padt_map = {'train': 'train', 'dev': 'dev', 'test': 'test'}
+        conllu_path = PADT_DIR / f'ar_padt-ud-{padt_map.get(split, split)}.conllu'
+        
+        N = len(self.texts)
+        MAX_CHARS = 16
+        diac_labels = torch.zeros(N, max_len, MAX_CHARS, dtype=torch.long)
+        diac_mask = torch.zeros(N, max_len, MAX_CHARS, dtype=torch.long)
+        
+        if not conllu_path.exists():
+            print(f'  ⚠️  No CoNLL-U for diac: {conllu_path}')
+            return diac_labels, diac_mask
+        
+        ALL_DIACS = set('\u064E\u064F\u0650\u0652\u0651\u064B\u064C\u064D\u0670\u0653\u0654\u0655')
+        SHADDA, FATHA, DAMMA, KASRA, SUKUN = '\u0651', '\u064E', '\u064F', '\u0650', '\u0652'
+        TF, TD, TK = '\u064B', '\u064C', '\u064D'
+        
+        def classify_diacs(vform):
+            result = []
+            i = 0
+            chars = list(vform)
+            while i < len(chars):
+                c = chars[i]
+                if c in ALL_DIACS:
+                    i += 1; continue
+                diacs = set()
+                j = i + 1
+                while j < len(chars) and chars[j] in ALL_DIACS:
+                    diacs.add(chars[j]); j += 1
+                sh = SHADDA in diacs
+                if sh and FATHA in diacs: label = 6
+                elif sh and DAMMA in diacs: label = 7
+                elif sh and KASRA in diacs: label = 8
+                elif sh and TF in diacs: label = 12
+                elif sh and TD in diacs: label = 13
+                elif sh and TK in diacs: label = 14
+                elif sh: label = 5
+                elif FATHA in diacs: label = 1
+                elif DAMMA in diacs: label = 2
+                elif KASRA in diacs: label = 3
+                elif SUKUN in diacs: label = 4
+                elif TF in diacs: label = 9
+                elif TD in diacs: label = 10
+                elif TK in diacs: label = 11
+                else: label = 0
+                result.append(label)
+                i = j
+            return result
+        
+        # Parse CoNLL-U to extract sentence-aligned Vform diacritics
+        sentences = []
+        current = []
+        with open(conllu_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    if current:
+                        sentences.append(current); current = []
+                    continue
+                if line.startswith('#'): continue
+                parts = line.split('\t')
+                if len(parts) < 10 or '-' in parts[0] or '.' in parts[0]: continue
+                vform = parts[1]  # fallback
+                if 'Vform=' in parts[9]:
+                    for field in parts[9].split('|'):
+                        if field.startswith('Vform='):
+                            vform = field.split('=', 1)[1]; break
+                current.append(classify_diacs(vform))
+            if current: sentences.append(current)
+        
+        # Align: our grid dataset sentences should match PADT order
+        n_aligned = min(len(sentences), N)
+        for si in range(n_aligned):
+            for wi, word_diacs in enumerate(sentences[si][:max_len]):
+                for ci, label in enumerate(word_diacs[:MAX_CHARS]):
+                    diac_labels[si, wi, ci] = label
+                    diac_mask[si, wi, ci] = 1
+        
+        print(f'  Loaded diac labels: {n_aligned}/{N} sentences aligned')
+        return diac_labels, diac_mask
 
     def __len__(self):
         return len(self.grids)
@@ -339,7 +426,9 @@ class RealArabicV2Dataset(Dataset):
             'dep_mask': dep_mask,
             'heads': heads_0idx,
             'relations': sol[:, 5].long(),
-            'cases': sol[:, 3].long()
+            'cases': sol[:, 3].long(),
+            'diac_labels': self.diac_labels_cache[idx].to(self.device),
+            'diac_mask': self.diac_mask_cache[idx].to(self.device),
         }
 
 
@@ -359,6 +448,7 @@ def get_layer_wise_lr_groups(model, base_lr=2e-3, decay=0.85):
                    list(model.gnn_refine.parameters()) +
                    list(model.second_order.parameters()) +
                    list(model.case_classifier.parameters()) +
+                   list(model.diac_head.parameters()) +
                    list(model.arc_head_mlp.parameters()) +
                    list(model.arc_dep_mlp.parameters()) +
                    list(model.rel_head_mlp.parameters()) +
@@ -403,7 +493,22 @@ def compute_accuracy(output_dict, batch):
         'case': case_correct / max(total, 1),
         'head': head_correct / max(dep_total, 1),
         'deprel': las_correct / max(dep_total, 1),
+        'diac': _compute_diac_acc(output_dict, batch),
     }
+
+def _compute_diac_acc(output_dict, batch):
+    """Character-level diac accuracy."""
+    pred_diacs = output_dict.get('pred_diacs')
+    diac_mask = batch.get('diac_mask')
+    diac_labels = batch.get('diac_labels')
+    if pred_diacs is None or diac_mask is None or diac_labels is None:
+        return 0.0
+    m = diac_mask.bool()
+    if not m.any():
+        return 0.0
+    correct = ((pred_diacs == diac_labels) & m).sum().item()
+    total = m.sum().item()
+    return correct / max(total, 1)
 
 def train_hrm_v2(args):
     print(f"\n{'='*60}")
@@ -489,6 +594,7 @@ def train_hrm_v2(args):
                 avg_acc['case'] += acc['case']
                 avg_acc['head'] += acc['head']
                 avg_acc['deprel'] += acc['deprel']
+                avg_acc['diac'] = avg_acc.get('diac', 0) + acc.get('diac', 0)
                 eval_batches += 1
                 if args.quick_test and eval_batches >= 1:
                     break
@@ -497,10 +603,11 @@ def train_hrm_v2(args):
         uas = avg_acc['head'] / n * 100
         las = avg_acc['deprel'] / n * 100
         case_acc = avg_acc['case'] / n * 100
+        diac_acc = avg_acc.get('diac', 0) / n * 100
         
         print(f"Epoch {epoch+1:03d} | Loss: {epoch_loss/max(n_batches,1):.4f} | "
               f"UAS: {uas:.2f}% | LAS: {las:.2f}% | "
-              f"Case: {case_acc:.2f}% | Time: {time.time()-t_start:.1f}s")
+              f"Case: {case_acc:.2f}% | Diac: {diac_acc:.2f}% | Time: {time.time()-t_start:.1f}s")
               
         ema.restore()
         
