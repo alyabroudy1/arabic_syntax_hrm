@@ -1,0 +1,47 @@
+{
+  "text": "بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ",
+  "emotion": "reverent",
+  "style": {
+    "speed": 0.82,
+    "pitch": 0.92,
+    "energy": 0.65
+  },
+  "segments": [
+    {
+      "word": "بِسْمِ",
+      "speed_factor": 0.82,
+      "pause_after_ms": 150,
+      "emphasis": "none",
+      "prosody_tags": []
+    },
+    {
+      "word": "ٱللَّهِ",
+      "speed_factor": 0.82,
+      "pause_after_ms": 150,
+      "emphasis": "none",
+      "prosody_tags": [
+        "لام شمسية"
+      ]
+    },
+    {
+      "word": "ٱلرَّحْمَٰنِ",
+      "speed_factor": 0.82,
+      "pause_after_ms": 150,
+      "emphasis": "moderate",
+      "prosody_tags": [
+        "لام شمسية",
+        "راء مفخمة"
+      ]
+    },
+    {
+      "word": "ٱلرَّحِيمِ",
+      "speed_factor": 0.82,
+      "pause_after_ms": 600,
+      "emphasis": "moderate",
+      "prosody_tags": [
+        "لام شمسية",
+        "راء مفخمة"
+      ]
+    }
+  ]
+}
