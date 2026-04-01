@@ -3,21 +3,18 @@
 Script 06: Train HRM on Arabic Syntax Grids
 ============================================
 
-Priority 3 — Feasibility check: Can HRM learn Arabic syntax at all?
-
-Architecture (adapted from sapientinc/HRM):
-    - Grid Encoder: embeds each cell of the input grid
-    - Manager (slow clock): processes global sentence structure every K steps
-    - Worker (fast clock): processes word-level features every step
-    - Grid Decoder: predicts solution grid from final states
-    - Deep Supervision: loss at every recurrent step
+Architecture Overhaul: Biaffine Dependency Parsing
+    - Grid Encoder: Per-column embedding -> word-level encoding
+    - Cross-word self-attention (Transformer layer)
+    - Biaffine Scorer for Head (UAS) and Relation (LAS)
+    - Deep Supervision across manager/worker steps.
 
 Usage:
-    # Quick feasibility check (100 sentences, small model)
+    # Quick test (256 hidden dim)
     python scripts/06_train_hrm.py --quick-test
     
     # Full training
-    python scripts/06_train_hrm.py --epochs 5000
+    python scripts/06_train_hrm.py --epochs 200
 """
 
 import argparse
@@ -40,298 +37,406 @@ OUTPUT_DIR = PROJECT_ROOT / "models" / "hrm_arabic_syntax"
 GRID_ROWS = 32         # max words
 GRID_COLS = 8           # features per word
 VOCAB_SIZE = 512        # max cell value
-MASKED_COLS = [3, 4, 5]  # case, head, deprel — columns to predict
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
+class ColumnDropout(nn.Module):
+    """Randomly zero out entire feature columns during training."""
+    def __init__(self, num_cols=8, drop_prob=0.15):
+        super().__init__()
+        self.num_cols = num_cols
+        self.drop_prob = drop_prob
+        # Never drop column 1 (POS). We drop: 0 (word bucket), 2 (morph), 6 (agr), 7 (def)
+        self.droppable_cols = [0, 2, 6, 7]
+    
+    def forward(self, grid):
+        if not self.training:
+            return grid
+        B, R, C = grid.shape
+        grid = grid.clone()
+        for col in self.droppable_cols:
+            if torch.rand(1).item() < self.drop_prob:
+                grid[:, :, col] = 0
+        return grid
 
-# ─────────────────────────────────────────────
-# Arabic Syntax HRM Model
-# ─────────────────────────────────────────────
+
 class ArabicSyntaxHRM(nn.Module):
     """
-    Hierarchical Recurrent Model adapted for Arabic syntax.
-    
-    Key properties (from HRM paper):
-    1. HIERARCHICAL RECURRENCE: Manager (slow) + Worker (fast)
-    2. DEEP SUPERVISION: Loss at every recurrent step
-    3. ONE-STEP GRADIENTS: Truncated BPTT to single step (stable training)
-    4. ITERATIVE REFINEMENT: Output of each step feeds back as input
+    Improved HRM with Biaffine Parsing and Cross-Word Attention.
+    Replaces earlier independent linear projection bottleneck.
     """
-    
-    def __init__(self, grid_rows=32, grid_cols=8, vocab_size=512,
-                 hidden_dim=256, manager_dim=128, worker_dim=128,
-                 embed_dim=64):
+    def __init__(
+        self,
+        grid_rows: int = 32,
+        grid_cols: int = 8,
+        vocab_size: int = 512,
+        embed_dim: int = 32,             # cell_embed_dim
+        hidden_dim: int = 256,           # word_dim
+        manager_dim: int = 256,
+        worker_dim: int = 256,
+        arc_dim: int = 128,
+        rel_dim: int = 64,
+        num_rels: int = 33,
+        num_cases: int = 5,
+        sa_heads: int = 4,
+        sa_layers: int = 1,
+        dropout: float = 0.33,
+    ):
         super().__init__()
         
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
         self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
         
-        # Cell embedding: each grid cell value → dense vector
-        self.cell_embed = nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)
+        # ── Embeddings ──
+        self.col_embeds = nn.ModuleList([
+            nn.Embedding(vocab_size + 1, embed_dim, padding_idx=0)
+            for _ in range(grid_cols)
+        ])
+        self.pos_embed = nn.Embedding(grid_rows, hidden_dim)
         
-        # Grid encoder: flatten embedded grid → global representation
-        grid_flat_dim = grid_rows * grid_cols * embed_dim
-        self.grid_encoder = nn.Sequential(
-            nn.Linear(grid_flat_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+        # ── Row Encoder ──
+        row_input_dim = grid_cols * embed_dim
+        self.row_encoder = nn.Sequential(
+            nn.Linear(row_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
         
-        # Row encoder: per-word (row) features → local representation
-        row_flat_dim = grid_cols * embed_dim
-        self.row_encoder = nn.Sequential(
-            nn.Linear(row_flat_dim, hidden_dim),
-            nn.GELU(),
+        # ── Global Pooling ──
+        self.global_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
         )
         
-        # Manager RNN (slow clock — sentence-level structure)
-        self.manager_rnn = nn.GRUCell(hidden_dim, manager_dim)
-        self.manager_goal = nn.Linear(manager_dim, worker_dim)
+        # ── Manager & Worker ──
+        self.manager_gru = nn.GRUCell(hidden_dim, manager_dim)
+        self.manager_goal_proj = nn.Linear(manager_dim, worker_dim)
+        self.worker_gru = nn.GRUCell(hidden_dim + worker_dim, worker_dim)
         
-        # Worker RNN (fast clock — word-level features)
-        self.worker_rnn = nn.GRUCell(
-            hidden_dim + worker_dim,  # global context + manager goal
-            worker_dim
+        # ── Context Fusion ──
+        fuse_input_dim = hidden_dim + manager_dim + worker_dim
+        self.context_fuse = nn.Sequential(
+            nn.Linear(fuse_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Dropout(dropout * 0.5),
         )
         
-        # Grid decoder: predict solution at each step
-        # Produces per-row predictions using worker state + row features
-        self.grid_decoder = nn.Sequential(
-            nn.Linear(worker_dim + manager_dim + hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+        # ── Self Attention ──
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=sa_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.cross_word_attn = nn.TransformerEncoder(encoder_layer, num_layers=sa_layers)
+        
+        # ── Biaffine Head Scorer ──
+        self.root_emb = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        
+        self.mlp_arc_dep = nn.Sequential(
+            nn.Linear(hidden_dim, arc_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+        )
+        self.mlp_arc_head = nn.Sequential(
+            nn.Linear(hidden_dim, arc_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
         )
         
-        # Per-column prediction heads (only for masked columns)
-        self.col_heads = nn.ModuleDict()
-        col_vocab_sizes = {
-            3: 5,    # case: 0-4 (none, Nom, Acc, Gen, Jus)
-            4: grid_rows + 1,  # dep head: 0-32 (pointer to word)
-            5: 32,   # dep rel: 0-31
-        }
-        for col_idx, col_vocab in col_vocab_sizes.items():
-            self.col_heads[str(col_idx)] = nn.Linear(hidden_dim, col_vocab)
-    
-    def forward(self, grid_input, mask, num_manager_steps=8, num_worker_steps=4):
-        """
-        Args:
-            grid_input: (B, R, C) int tensor — input grid with masked cells
-            mask: (B, R) int tensor — 1 for real words, 0 for padding
-            num_manager_steps: slow clock iterations
-            num_worker_steps: fast clock ticks per manager step
+        self.W_arc = nn.Parameter(torch.empty(arc_dim, arc_dim))
+        self.u_arc = nn.Linear(arc_dim, 1, bias=False)
+        self.v_arc = nn.Linear(arc_dim, 1, bias=False)
+        nn.init.xavier_uniform_(self.W_arc)
+        
+        max_rel_dist = grid_rows + 1
+        self.dist_bias = nn.Embedding(2 * max_rel_dist + 1, 1)
+        nn.init.zeros_(self.dist_bias.weight)
+        
+        # ── Conditioned Relation Scorer ──
+        self.mlp_rel_dep = nn.Sequential(
+            nn.Linear(hidden_dim, rel_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+        )
+        self.mlp_rel_head = nn.Sequential(
+            nn.Linear(hidden_dim, rel_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+        )
+        
+        self.W_rel = nn.Parameter(torch.empty(num_rels, rel_dim, rel_dim))
+        self.u_rel = nn.Linear(rel_dim, num_rels, bias=False)
+        self.v_rel = nn.Linear(rel_dim, num_rels, bias=False)
+        self.b_rel = nn.Parameter(torch.zeros(num_rels))
+        nn.init.xavier_uniform_(self.W_rel)
+        
+        # ── Case Prediction ──
+        self.case_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_dim // 2, num_cases),
+        )
+        
+        # ── Regularization ──
+        self.embed_drop = nn.Dropout(0.2)
+        self.gru_drop = nn.Dropout(0.25)
+        self.word_drop_rate = 0.1
+
+    def encode_grid_to_words(self, grid, mask):
+        B, R, C = grid.shape
+        col_embs = []
+        for c in range(C):
+            col_vals = grid[:, :, c].clamp(0, self.vocab_size)
+            col_embs.append(self.col_embeds[c](col_vals))
             
-        Returns:
-            all_predictions: list of dicts {col_idx: (B, R, V)} at each step
-            final_prediction: dict {col_idx: (B, R, V)} — final solution logits
-        """
-        B = grid_input.shape[0]
+        row_features = torch.cat(col_embs, dim=-1)
+        row_features = self.embed_drop(row_features)
         
-        # Embed grid cells: (B, R, C) → (B, R, C, embed_dim)
-        cell_embeds = self.cell_embed(grid_input.clamp(0, self.vocab_size))
+        h_words = self.row_encoder(row_features)
+        positions = torch.arange(R, device=grid.device)
+        h_words = h_words + self.pos_embed(positions)
         
-        # Global grid representation: (B, R*C*embed_dim) → (B, hidden)
-        flat_embeds = cell_embeds.reshape(B, -1)
-        grid_repr = self.grid_encoder(flat_embeds)
+        if self.training and self.word_drop_rate > 0:
+            word_mask = torch.bernoulli(
+                torch.full((B, R, 1), 1.0 - self.word_drop_rate, device=grid.device)
+            )
+            h_words = h_words * word_mask / (1.0 - self.word_drop_rate)
+        return h_words
+
+    def score_heads(self, h_enriched, mask):
+        B, R, _ = h_enriched.shape
+        root = self.root_emb.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        h_candidates = torch.cat([root, h_enriched], dim=1)
         
-        # Per-row representations: (B, R, C*embed_dim) → (B, R, hidden)
-        row_embeds = cell_embeds.reshape(B, self.grid_rows, -1)
-        row_repr = self.row_encoder(row_embeds)
+        dep = self.mlp_arc_dep(h_enriched)
+        head = self.mlp_arc_head(h_candidates)
         
-        # Initialize RNN states
-        manager_state = torch.zeros(B, self.manager_rnn.hidden_size,
-                                     device=grid_input.device)
-        worker_state = torch.zeros(B, self.worker_rnn.hidden_size,
-                                    device=grid_input.device)
+        scores = torch.bmm(dep @ self.W_arc, head.transpose(1, 2))
+        scores += self.u_arc(dep)
+        scores += self.v_arc(head).transpose(1, 2)
         
-        all_predictions = []
+        dep_pos = torch.arange(R, device=scores.device)
+        head_pos = torch.arange(-1, R, device=scores.device)
+        rel_dist = head_pos.unsqueeze(0) - dep_pos.unsqueeze(1)
+        
+        max_d = self.dist_bias.num_embeddings // 2
+        dist_idx = (rel_dist + max_d).clamp(0, 2 * max_d)
+        d_bias = self.dist_bias(dist_idx).squeeze(-1)
+        scores = scores + d_bias.unsqueeze(0)
+        
+        cand_mask = torch.cat([mask.new_ones(B, 1), mask], dim=1).bool()
+        scores = scores.masked_fill(~cand_mask.unsqueeze(1), -1e4)
+        
+        self_loop = torch.zeros(R, R + 1, dtype=torch.bool, device=scores.device)
+        for i in range(R):
+            self_loop[i, i + 1] = True
+        scores = scores.masked_fill(self_loop.unsqueeze(0), -1e4)
+        
+        return scores
+
+    def score_rels(self, h_enriched, head_indices, mask):
+        B, R, _ = h_enriched.shape
+        root = self.root_emb.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        h_with_root = torch.cat([root, h_enriched], dim=1)
+        
+        dep = self.mlp_rel_dep(h_enriched)
+        head_all = self.mlp_rel_head(h_with_root)
+        
+        idx = head_indices.clamp(0, R)
+        idx_exp = idx.unsqueeze(-1).expand(-1, -1, head_all.shape[-1])
+        head_sel = torch.gather(head_all, dim=1, index=idx_exp)
+        
+        scores = torch.einsum('bnd,rde,bne->bnr', dep, self.W_rel, head_sel)
+        scores = scores + self.u_rel(dep) + self.v_rel(head_sel) + self.b_rel
+        return scores
+
+    def forward(self, grid, mask, num_manager_steps=8, num_worker_steps=4, gold_heads=None):
+        B = grid.shape[0]
+        R = self.grid_rows
+        device = grid.device
+        
+        manager_h = torch.zeros(B, self.manager_gru.hidden_size, device=device)
+        worker_h  = torch.zeros(B, self.worker_gru.hidden_size, device=device)
+        
+        current_grid = grid.clone()
+        step_outputs = []
         
         for m_step in range(num_manager_steps):
-            # Manager update (slow clock — one step per outer loop)
-            manager_state = self.manager_rnn(grid_repr, manager_state)
-            manager_goal = self.manager_goal(manager_state)
+            h_words = self.encode_grid_to_words(current_grid, mask)
+            
+            mask_f = mask.unsqueeze(-1).float()
+            h_global = (h_words * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+            h_global = self.global_proj(h_global)
+            
+            manager_h = self.manager_gru(h_global, manager_h)
+            manager_h = self.gru_drop(manager_h)
+            goal = self.manager_goal_proj(manager_h)
             
             for w_step in range(num_worker_steps):
-                # Worker update (fast clock)
-                worker_input = torch.cat([grid_repr, manager_goal], dim=-1)
-                worker_state = self.worker_rnn(worker_input, worker_state)
+                w_in = torch.cat([h_global, goal], dim=-1)
+                worker_h = self.worker_gru(w_in, worker_h)
+                worker_h = self.gru_drop(worker_h)
                 
-                # Decode: combine worker + manager + row features for per-row prediction
-                # Broadcast worker & manager states to each row
-                worker_exp = worker_state.unsqueeze(1).expand(-1, self.grid_rows, -1)
-                manager_exp = manager_state.unsqueeze(1).expand(-1, self.grid_rows, -1)
+                m_exp = manager_h.unsqueeze(1).expand(-1, R, -1)
+                w_exp = worker_h.unsqueeze(1).expand(-1, R, -1)
+                fused = torch.cat([h_words, m_exp, w_exp], dim=-1)
+                h_enriched = self.context_fuse(fused)
                 
-                combined = torch.cat([worker_exp, manager_exp, row_repr], dim=-1)
-                decoded = self.grid_decoder(combined)  # (B, R, hidden)
+                sa_pad_mask = ~mask.bool()
+                h_enriched = self.cross_word_attn(h_enriched, src_key_padding_mask=sa_pad_mask)
                 
-                # Per-column predictions
-                step_preds = {}
-                for col_str, head in self.col_heads.items():
-                    col_logits = head(decoded)  # (B, R, col_vocab)
-                    step_preds[int(col_str)] = col_logits
+                arc_scores = self.score_heads(h_enriched, mask)
+                case_logits = self.case_head(h_enriched)
                 
-                all_predictions.append(step_preds)
+                if self.training and gold_heads is not None:
+                    rel_head_input = gold_heads
+                else:
+                    rel_head_input = arc_scores.argmax(dim=-1)
                 
-                # Iterative refinement: update grid with current predictions
-                # This is key to HRM — each step refines the solution
-                pred_grid = grid_input.clone()
-                for col_idx, logits in step_preds.items():
-                    pred_vals = logits.argmax(dim=-1)  # (B, R)
-                    # Only fill masked positions (where input is 0)
-                    is_masked = (grid_input[:, :, col_idx] == 0)
-                    pred_grid[:, :, col_idx] = torch.where(
-                        is_masked, pred_vals, grid_input[:, :, col_idx]
-                    )
+                rel_scores = self.score_rels(h_enriched, rel_head_input, mask)
                 
-                # Re-encode with updated grid
-                cell_embeds = self.cell_embed(pred_grid.clamp(0, self.vocab_size))
-                flat_embeds = cell_embeds.reshape(B, -1)
-                grid_repr = self.grid_encoder(flat_embeds)
-                row_embeds = cell_embeds.reshape(B, self.grid_rows, -1)
-                row_repr = self.row_encoder(row_embeds)
-        
-        return all_predictions, all_predictions[-1]
+                step_preds = {
+                    4: arc_scores,    # head
+                    5: rel_scores,    # deprel
+                    3: case_logits,   # case
+                }
+                step_outputs.append(step_preds)
+                
+                with torch.no_grad():
+                    pred_heads = arc_scores.argmax(dim=-1)
+                    pred_rels  = rel_scores.argmax(dim=-1)
+                    pred_cases = case_logits.argmax(dim=-1)
+                    
+                    new_grid = current_grid.clone()
+                    new_grid[:, :, 3] = torch.where(grid[:, :, 3] == 0, pred_cases, new_grid[:, :, 3])
+                    new_grid[:, :, 4] = torch.where(grid[:, :, 4] == 0, pred_heads, new_grid[:, :, 4])
+                    new_grid[:, :, 5] = torch.where(grid[:, :, 5] == 0, pred_rels, new_grid[:, :, 5])
+                    current_grid = new_grid
+                    
+        return step_outputs, step_outputs[-1]
 
 
-# ─────────────────────────────────────────────
-# Deep Supervision Loss
-# ─────────────────────────────────────────────
-def deep_supervision_loss(all_predictions, solution, mask, masked_cols=MASKED_COLS):
-    """
-    Weighted sum of losses over all recurrent steps.
-    Later steps get higher weight (they should be more accurate).
-    
-    Args:
-        all_predictions: list of dicts {col_idx: (B, R, V)} 
-        solution: (B, R, C) int tensor — ground truth
-        mask: (B, R) int tensor — 1 for real words
-        masked_cols: which columns to compute loss on
-    """
+def compute_loss(step_outputs, solution, mask, arc_weight=0.5, rel_weight=0.3, case_weight=0.2):
     total_loss = 0.0
-    num_steps = len(all_predictions)
+    num_steps = len(step_outputs)
+    flat_mask = mask.reshape(-1).float()
+    num_real = flat_mask.sum().clamp(min=1)
     
-    for step_idx, step_preds in enumerate(all_predictions):
-        # Linear weight: later steps count more
-        weight = (step_idx + 1) / num_steps
-        
-        step_loss = 0.0
-        for col_idx in masked_cols:
-            if col_idx not in step_preds:
-                continue
-            
-            col_logits = step_preds[col_idx]  # (B, R, V)
-            col_target = solution[:, :, col_idx].long()  # (B, R)
-            
-            # Flatten
-            B, R, V = col_logits.shape
-            logits_flat = col_logits.reshape(-1, V)
-            target_flat = col_target.reshape(-1)
-            mask_flat = mask.reshape(-1).float()
-            
-            # CE loss with word mask
-            ce_loss = F.cross_entropy(logits_flat, target_flat, reduction='none')
-            masked_loss = (ce_loss * mask_flat).sum() / mask_flat.sum().clamp(min=1)
-            step_loss += masked_loss
-        
-        total_loss += weight * step_loss
+    gold_cases = solution[:, :, 3].long()
+    gold_heads = solution[:, :, 4].long()
+    gold_rels = solution[:, :, 5].long()
     
-    return total_loss / num_steps
+    for t, step in enumerate(step_outputs):
+        w_t = (t + 1) / num_steps
+        
+        # Arc loss
+        arc = step[4]
+        arc_loss = F.cross_entropy(
+            arc.reshape(-1, arc.shape[-1]), gold_heads.reshape(-1), 
+            reduction='none', label_smoothing=0.03
+        )
+        arc_loss = (arc_loss * flat_mask).sum() / num_real
+        
+        # Rel loss
+        rel = step[5]
+        rel_loss = F.cross_entropy(
+            rel.reshape(-1, rel.shape[-1]), gold_rels.reshape(-1), 
+            reduction='none', label_smoothing=0.1
+        )
+        rel_loss = (rel_loss * flat_mask).sum() / num_real
+        
+        # Case loss
+        cas = step[3]
+        case_loss = F.cross_entropy(
+            cas.reshape(-1, cas.shape[-1]), gold_cases.reshape(-1), 
+            reduction='none', label_smoothing=0.1
+        )
+        case_loss = (case_loss * flat_mask).sum() / num_real
+        
+        step_loss = (arc_weight * arc_loss + rel_weight * rel_loss + case_weight * case_loss)
+        total_loss += w_t * step_loss
 
+    return total_loss
 
-# ─────────────────────────────────────────────
-# Accuracy Metrics
-# ─────────────────────────────────────────────
-def compute_accuracy(predictions, solution, mask, masked_cols=MASKED_COLS):
-    """Compute per-column and overall accuracy."""
-    metrics = {}
-    total_correct = 0
-    total_count = 0
+def compute_accuracy(final_pred, solution, mask):
+    gold_cases = solution[:, :, 3]
+    gold_heads = solution[:, :, 4]
+    gold_rels = solution[:, :, 5]
     
-    for col_idx in masked_cols:
-        if col_idx not in predictions:
-            continue
-        
-        pred_vals = predictions[col_idx].argmax(dim=-1)  # (B, R)
-        true_vals = solution[:, :, col_idx]
-        
-        correct = ((pred_vals == true_vals) * mask).sum().item()
-        count = mask.sum().item()
-        
-        col_names = {3: 'case', 4: 'head', 5: 'deprel'}
-        metrics[col_names.get(col_idx, f'col{col_idx}')] = correct / max(count, 1)
-        
-        total_correct += correct
-        total_count += count
+    m = mask.bool()
     
-    metrics['overall'] = total_correct / max(total_count, 1)
-    return metrics
+    pred_cases = final_pred[3].argmax(dim=-1)
+    pred_heads = final_pred[4].argmax(dim=-1)
+    pred_rels = final_pred[5].argmax(dim=-1)
+    
+    case_correct = ((pred_cases == gold_cases) & m).sum().item()
+    head_correct = ((pred_heads == gold_heads) & m).sum().item()
+    rel_correct = ((pred_rels == gold_rels) & m).sum().item()
+    
+    total = m.sum().item()
+    
+    return {
+        'case': case_correct / max(total, 1),
+        'head': head_correct / max(total, 1),
+        'deprel': rel_correct / max(total, 1),
+        'overall': (case_correct + head_correct + rel_correct) / (3 * max(total, 1))
+    }
 
-
-# ─────────────────────────────────────────────
-# Training Loop
-# ─────────────────────────────────────────────
 def train_hrm(args):
     print(f"\n{'='*60}")
-    print(f"Training HRM on Arabic Syntax Grids")
+    print(f"Training HRM (BIAFFINE OVERHAUL) on Arabic Syntax Grids")
     print(f"{'='*60}")
-    print(f"  Device: {DEVICE}")
-    print(f"  Epochs: {args.epochs}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Manager steps: {args.manager_steps}")
-    print(f"  Worker steps: {args.worker_steps}")
-    print(f"  Hidden dim: {args.hidden_dim}")
     
-    # Load data
-    print(f"\nLoading data from {DATA_DIR}...")
-    train_grids = torch.from_numpy(np.load(DATA_DIR / "train_grids.npy")).to(DEVICE)
-    train_masks = torch.from_numpy(np.load(DATA_DIR / "train_masks.npy")).to(DEVICE)
-    train_solutions = torch.from_numpy(np.load(DATA_DIR / "train_solutions.npy")).to(DEVICE)
+    train_grids = torch.from_numpy(np.load(DATA_DIR / "train_grids.npy")).long()
+    train_masks = torch.from_numpy(np.load(DATA_DIR / "train_masks.npy")).long()
+    train_solutions = torch.from_numpy(np.load(DATA_DIR / "train_solutions.npy")).long()
     
-    dev_grids = torch.from_numpy(np.load(DATA_DIR / "dev_grids.npy")).to(DEVICE)
-    dev_masks = torch.from_numpy(np.load(DATA_DIR / "dev_masks.npy")).to(DEVICE)
-    dev_solutions = torch.from_numpy(np.load(DATA_DIR / "dev_solutions.npy")).to(DEVICE)
-    
-    print(f"  Train: {train_grids.shape[0]} examples, shape {train_grids.shape}")
-    print(f"  Dev: {dev_grids.shape[0]} examples, shape {dev_grids.shape}")
-    
-    # Create model
+    dev_grids = torch.from_numpy(np.load(DATA_DIR / "dev_grids.npy")).long()
+    dev_masks = torch.from_numpy(np.load(DATA_DIR / "dev_masks.npy")).long()
+    dev_solutions = torch.from_numpy(np.load(DATA_DIR / "dev_solutions.npy")).long()
+
     model = ArabicSyntaxHRM(
-        grid_rows=GRID_ROWS,
-        grid_cols=GRID_COLS,
-        vocab_size=VOCAB_SIZE,
-        hidden_dim=args.hidden_dim,
-        manager_dim=args.hidden_dim // 2,
-        worker_dim=args.hidden_dim // 2,
-        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim, 
+        manager_dim=args.hidden_dim, 
+        worker_dim=args.hidden_dim, 
+        embed_dim=args.embed_dim
     ).to(DEVICE)
     
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"\n  Model parameters: {num_params:,} ({num_params/1e6:.1f}M)")
+    print(f"Model Parameters: {num_params/1e6:.2f}M")
     
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=args.lr,
-        weight_decay=0.01
-    )
+    col_dropout = ColumnDropout(drop_prob=0.15)
+    
+    biaffine_params, other_params = [], []
+    for name, p in model.named_parameters():
+        if 'W_arc' in name or 'W_rel' in name or 'dist_bias' in name:
+            biaffine_params.append(p)
+        else:
+            other_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {'params': other_params,    'lr': 2e-3, 'weight_decay': 0.02},
+        {'params': biaffine_params, 'lr': 1e-3, 'weight_decay': 0.0},  
+    ])
+    
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+        optimizer, T_max=args.epochs, eta_min=1e-5
     )
-    
-    # Training
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     best_dev_acc = 0.0
     best_dev_loss = float('inf')
     
-    print(f"\nStarting training...\n")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     for epoch in range(args.epochs):
         model.train()
@@ -339,140 +444,104 @@ def train_hrm(args):
         num_batches = 0
         t_start = time.time()
         
-        # Shuffle
-        perm = torch.randperm(train_grids.shape[0], device=DEVICE)
+        perm = torch.randperm(train_grids.shape[0])
         
         for start in range(0, train_grids.shape[0], args.batch_size):
             end = min(start + args.batch_size, train_grids.shape[0])
             idx = perm[start:end]
             
-            batch_grids = train_grids[idx]
-            batch_masks = train_masks[idx]
-            batch_solutions = train_solutions[idx]
+            b_grids = train_grids[idx].to(DEVICE)
+            b_masks = train_masks[idx].to(DEVICE)
+            b_sols = train_solutions[idx].to(DEVICE)
+            b_gold_heads = b_sols[:, :, 4]
+            
+            b_grids_dropped = col_dropout(b_grids)
             
             optimizer.zero_grad()
-            
             all_preds, final_pred = model(
-                batch_grids, batch_masks,
-                args.manager_steps, args.worker_steps
+                b_grids_dropped, b_masks, 
+                args.manager_steps, args.worker_steps, 
+                gold_heads=b_gold_heads
             )
             
-            loss = deep_supervision_loss(
-                all_preds, batch_solutions, batch_masks
-            )
-            
+            loss = compute_loss(all_preds, b_sols, b_masks)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             epoch_loss += loss.item()
             num_batches += 1
-        
+            
         scheduler.step()
         avg_loss = epoch_loss / max(num_batches, 1)
         elapsed = time.time() - t_start
         
-        # Evaluate periodically
-        eval_freq = max(1, args.epochs // 50)  # ~50 eval points
+        eval_freq = max(1, args.epochs // 20)
         if (epoch + 1) % eval_freq == 0 or epoch == 0:
             model.eval()
             with torch.no_grad():
-                # Evaluate on dev set (or subset if large)
                 eval_size = min(512, dev_grids.shape[0])
+                b_grids = dev_grids[:eval_size].to(DEVICE)
+                b_masks = dev_masks[:eval_size].to(DEVICE)
+                b_sols = dev_solutions[:eval_size].to(DEVICE)
+                
                 all_preds, final_pred = model(
-                    dev_grids[:eval_size], dev_masks[:eval_size],
+                    b_grids, b_masks, 
                     args.manager_steps, args.worker_steps
                 )
-                dev_loss = deep_supervision_loss(
-                    all_preds, dev_solutions[:eval_size], dev_masks[:eval_size]
-                ).item()
+                dev_loss = compute_loss(all_preds, b_sols, b_masks).item()
+                metrics = compute_accuracy(final_pred, b_sols, b_masks)
                 
-                metrics = compute_accuracy(
-                    final_pred, dev_solutions[:eval_size], dev_masks[:eval_size]
-                )
-            
             lr = scheduler.get_last_lr()[0]
-            print(f"  Epoch {epoch+1:>5}/{args.epochs} │ "
-                  f"Loss: {avg_loss:.4f} │ "
-                  f"Dev Loss: {dev_loss:.4f} │ "
-                  f"Case: {metrics.get('case', 0):.3f} │ "
-                  f"Head: {metrics.get('head', 0):.3f} │ "
-                  f"DepRel: {metrics.get('deprel', 0):.3f} │ "
-                  f"Overall: {metrics['overall']:.3f} │ "
-                  f"LR: {lr:.2e} │ "
-                  f"{elapsed:.1f}s")
+            print(f"Epoch {epoch+1:>3}/{args.epochs} | "
+                  f"Loss: {avg_loss:.4f} | Dev Loss: {dev_loss:.4f} | "
+                  f"Case: {metrics['case']:.3f} | UAS/Head: {metrics['head']:.3f} | "
+                  f"LAS/Rel: {metrics['deprel']:.3f} | LR: {lr:.2e} | {elapsed:.1f}s")
             
-            # Save best model
-            if metrics['overall'] > best_dev_acc:
-                best_dev_acc = metrics['overall']
+            if metrics['head'] > best_dev_acc:
+                best_dev_acc = metrics['head']
                 torch.save(model.state_dict(), OUTPUT_DIR / "best_hrm.pt")
-                print(f"           → New best! (overall acc: {best_dev_acc:.4f})")
             
             if dev_loss < best_dev_loss:
                 best_dev_loss = dev_loss
-    
-    # Save final model
+
     torch.save(model.state_dict(), OUTPUT_DIR / "final_hrm.pt")
     
-    # Save training config
     config = {
         'grid_rows': GRID_ROWS, 'grid_cols': GRID_COLS,
         'vocab_size': VOCAB_SIZE, 'hidden_dim': args.hidden_dim,
-        'manager_dim': args.hidden_dim // 2, 'worker_dim': args.hidden_dim // 2,
+        'manager_dim': args.hidden_dim, 'worker_dim': args.hidden_dim,
         'embed_dim': args.embed_dim,
         'manager_steps': args.manager_steps, 'worker_steps': args.worker_steps,
-        'epochs': args.epochs, 'batch_size': args.batch_size, 'lr': args.lr,
+        'epochs': args.epochs, 'batch_size': args.batch_size, 'lr': 2e-3,
         'best_dev_acc': best_dev_acc, 'best_dev_loss': best_dev_loss,
         'num_params': num_params, 'device': str(DEVICE),
     }
     with open(OUTPUT_DIR / "config.json", "w") as f:
         json.dump(config, f, indent=2)
-    
-    print(f"\n{'='*60}")
-    print(f"Training Complete!")
-    print(f"{'='*60}")
-    print(f"  Best dev accuracy: {best_dev_acc:.4f} ({best_dev_acc*100:.1f}%)")
-    print(f"  Best dev loss: {best_dev_loss:.4f}")
-    print(f"  Model saved to: {OUTPUT_DIR}")
-    print(f"  Parameters: {num_params:,} ({num_params/1e6:.1f}M)")
-    
-    # Target metrics
-    print(f"\n  Target Metrics:")
-    print(f"    Case accuracy > 90%: {'✅' if metrics.get('case', 0) > 0.9 else '❌'} ({metrics.get('case', 0)*100:.1f}%)")
-    print(f"    Head accuracy > 85%: {'✅' if metrics.get('head', 0) > 0.85 else '❌'} ({metrics.get('head', 0)*100:.1f}%)")
-    print(f"    DepRel accuracy > 80%: {'✅' if metrics.get('deprel', 0) > 0.8 else '❌'} ({metrics.get('deprel', 0)*100:.1f}%)")
-    
-    return model, config
 
-
-# ─────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Train HRM on Arabic Syntax Grids")
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--embed-dim", type=int, default=64)
-    parser.add_argument("--manager-steps", type=int, default=8)
-    parser.add_argument("--worker-steps", type=int, default=4)
-    parser.add_argument("--quick-test", action="store_true",
-                         help="Quick feasibility check (200 epochs, tiny model)")
+    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--manager-steps", type=int, default=4)
+    parser.add_argument("--worker-steps", type=int, default=2)
+    parser.add_argument("--quick-test", action="store_true")
     
     args = parser.parse_args()
     
     if args.quick_test:
-        print("🚀 Quick test mode: 200 epochs, smaller model")
-        args.epochs = 200
-        args.hidden_dim = 128
+        print("🚀 Quick test mode: Biaffine Overhaul -> 256 dim")
+        args.epochs = 50 
+        args.hidden_dim = 256
         args.embed_dim = 32
         args.batch_size = 64
-        args.manager_steps = 4
-        args.worker_steps = 2
+        args.manager_steps = 2
+        args.worker_steps = 1
     
     train_hrm(args)
-
 
 if __name__ == "__main__":
     main()
