@@ -1,233 +1,271 @@
 #!/usr/bin/env python3
 """
-Script 09: Export Models for Android Deployment
-=================================================
+Script 09: Export HRM-Grid Parser V2 to ONNX for Android
+=========================================================
 
-Exports:
-1. LLM → GGUF via llama.cpp (Q4_K_M quantization, ~1.5GB)
-2. HRM → ONNX (optimized, ~50MB)
-
-⚠️  LLM export requires: llama.cpp (auto-cloned)
-⚠️  HRM export works on CPU/MPS
+Loads the best trained V2 model and exports it to ONNX format
+suitable for ONNX Runtime on Android.
 
 Usage:
-    # Export HRM only (works locally)
-    python scripts/09_export_android.py --hrm-only
-    
-    # Export everything (needs LLM model)
     python scripts/09_export_android.py
+    python scripts/09_export_android.py --test  # verify against PyTorch output
 """
 
 import argparse
 import os
-import subprocess
+import sys
 import torch
-import json
+import torch.nn as nn
+import numpy as np
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from models.v2.parser import ArabicHRMGridParserV2, ParserConfig
+
 OUTPUT_DIR = PROJECT_ROOT / "android" / "models"
+CHECKPOINT_DIR = PROJECT_ROOT / "models" / "v2_arabic_syntax"
 
 
-def export_hrm_onnx(model_dir: str = "models/hrm_arabic_syntax"):
-    """Export trained HRM to ONNX format."""
+class HRMv2ExportWrapper(nn.Module):
+    """Thin wrapper around the parser for ONNX export.
+    
+    Flattens the input format to simple tensors (no dict) and
+    returns only the prediction outputs needed at inference time.
+    """
+    
+    def __init__(self, parser: ArabicHRMGridParserV2):
+        super().__init__()
+        self.parser = parser
+    
+    def forward(
+        self,
+        word_ids: torch.LongTensor,       # (B, W)
+        pos_tags: torch.LongTensor,       # (B, W)
+        char_ids: torch.LongTensor,       # (B, W, C)
+        bpe_ids: torch.LongTensor,        # (B, W, S)
+        root_ids: torch.LongTensor,       # (B, W)
+        pattern_ids: torch.LongTensor,    # (B, W)
+        proclitic_ids: torch.LongTensor,  # (B, W)
+        enclitic_ids: torch.LongTensor,   # (B, W)
+        diac_ids: torch.LongTensor,       # (B, W, C)
+        mask: torch.LongTensor,           # (B, W)
+    ):
+        batch = {
+            'word_ids': word_ids,
+            'pos_tags': pos_tags,
+            'char_ids': char_ids,
+            'bpe_ids': bpe_ids,
+            'root_ids': root_ids,
+            'pattern_ids': pattern_ids,
+            'proclitic_ids': proclitic_ids,
+            'enclitic_ids': enclitic_ids,
+            'diac_ids': diac_ids,
+            'mask': mask,
+        }
+        
+        out = self.parser(batch, epoch=0, training=False)
+        
+        # Return: pred_heads (B, W), pred_rels (B, W), pred_cases (B, W)
+        return out['pred_heads'], out['pred_rels'], out['pred_cases']
+
+
+def export_onnx(checkpoint_path: Path = None):
+    """Export trained V2 parser to ONNX."""
     
     print(f"\n{'='*50}")
-    print(f"Exporting HRM to ONNX")
+    print(f"Exporting HRM-Grid Parser V2 to ONNX")
     print(f"{'='*50}")
     
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "train_hrm",
-        str(PROJECT_ROOT / "scripts" / "06_train_hrm.py")
-    )
-    hrm_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(hrm_module)
+    # Find checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = CHECKPOINT_DIR / "best_model.pt"
     
-    model_path = PROJECT_ROOT / model_dir
-    config_path = model_path / "config.json"
-    
-    if not config_path.exists():
-        print(f"  ❌ Config not found: {config_path}")
+    if not checkpoint_path.exists():
+        print(f"  ❌ Checkpoint not found: {checkpoint_path}")
         return None
     
-    with open(config_path) as f:
-        config = json.load(f)
+    print(f"  📦 Loading checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     
-    # Load model
-    model = hrm_module.ArabicSyntaxHRM(
-        grid_rows=config['grid_rows'],
-        grid_cols=config['grid_cols'],
-        vocab_size=config['vocab_size'],
-        hidden_dim=config['hidden_dim'],
-        manager_dim=config['manager_dim'],
-        worker_dim=config['worker_dim'],
-        embed_dim=config.get('embed_dim', 64),
+    # Recreate config (must match training config)
+    config = ParserConfig(
+        word_dim=384,
+        n_heads=6,
+        n_transformer_layers=3,
+        n_gnn_rounds=3,
+        n_relations=50,
+        n_cases=4,
     )
     
-    best_path = model_path / "best_hrm.pt"
-    if best_path.exists():
-        model.load_state_dict(torch.load(best_path, map_location="cpu"))
-    else:
-        print(f"  ❌ Model not found: {best_path}")
-        return None
-    
+    model = ArabicHRMGridParserV2(config)
+    model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     
-    # Wrap model for ONNX export (fixed manager/worker steps)
-    class HRMExportWrapper(torch.nn.Module):
-        def __init__(self, hrm, manager_steps=8, worker_steps=4):
-            super().__init__()
-            self.hrm = hrm
-            self.manager_steps = manager_steps
-            self.worker_steps = worker_steps
-        
-        def forward(self, grid_input, mask):
-            _, final_pred = self.hrm(
-                grid_input, mask,
-                self.manager_steps, self.worker_steps
-            )
-            # Stack predictions into single tensor
-            results = []
-            for col_idx in sorted(final_pred.keys()):
-                results.append(final_pred[col_idx].argmax(dim=-1))
-            return torch.stack(results, dim=-1)  # (B, R, num_pred_cols)
+    uas = ckpt.get('uas', 'N/A')
+    las = ckpt.get('las', 'N/A')
+    epoch = ckpt.get('epoch', 'N/A')
+    print(f"  📊 Checkpoint epoch={epoch}, UAS={uas}%, LAS={las}%")
     
-    wrapper = HRMExportWrapper(
-        model,
-        config.get('manager_steps', 8),
-        config.get('worker_steps', 4)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"  📐 Parameters: {num_params/1e6:.2f}M")
+    
+    # Wrap for ONNX
+    wrapper = HRMv2ExportWrapper(model)
+    wrapper.eval()
+    
+    # Create dummy inputs matching training shapes
+    B, W, C, S = 1, 32, 8, 4  # batch, seq_len, char_len, bpe_len
+    dummy_inputs = (
+        torch.randint(1, 100, (B, W)),   # word_ids
+        torch.randint(1, 20, (B, W)),    # pos_tags
+        torch.randint(1, 100, (B, W, C)), # char_ids
+        torch.randint(1, 100, (B, W, S)), # bpe_ids
+        torch.randint(1, 100, (B, W)),   # root_ids
+        torch.randint(1, 100, (B, W)),   # pattern_ids
+        torch.randint(1, 100, (B, W)),   # proclitic_ids
+        torch.randint(1, 50, (B, W)),    # enclitic_ids
+        torch.randint(0, 20, (B, W, C)), # diac_ids
+        torch.ones(B, W, dtype=torch.long),  # mask
     )
     
-    # Create dummy inputs
-    dummy_grid = torch.randint(0, 50, (1, config['grid_rows'], config['grid_cols']))
-    dummy_mask = torch.ones(1, config['grid_rows'], dtype=torch.int32)
+    # Test forward pass
+    print("  🔄 Testing forward pass...")
+    with torch.no_grad():
+        heads, rels, cases = wrapper(*dummy_inputs)
+    print(f"     Output shapes: heads={heads.shape}, rels={rels.shape}, cases={cases.shape}")
     
-    # Export
+    # Export ONNX
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    onnx_path = OUTPUT_DIR / "arabic_syntax_hrm.onnx"
+    onnx_path = OUTPUT_DIR / "arabic_syntax_hrm_v2.onnx"
     
+    input_names = [
+        "word_ids", "pos_tags", "char_ids", "bpe_ids",
+        "root_ids", "pattern_ids", "proclitic_ids", "enclitic_ids",
+        "diac_ids", "mask"
+    ]
+    output_names = ["pred_heads", "pred_rels", "pred_cases"]
+    
+    dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
+    
+    print(f"  📤 Exporting to ONNX (opset 14)...")
     try:
         torch.onnx.export(
             wrapper,
-            (dummy_grid, dummy_mask),
+            dummy_inputs,
             str(onnx_path),
-            input_names=["grid_input", "mask"],
-            output_names=["predictions"],
-            dynamic_axes={
-                "grid_input": {0: "batch"},
-                "mask": {0: "batch"},
-                "predictions": {0: "batch"},
-            },
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
             opset_version=14,
+            do_constant_folding=True,
         )
         
         size_mb = os.path.getsize(onnx_path) / 1e6
         print(f"  ✅ ONNX exported: {onnx_path}")
         print(f"     Size: {size_mb:.1f} MB")
-        return size_mb
+        return onnx_path, size_mb
         
     except Exception as e:
         print(f"  ❌ ONNX export failed: {e}")
-        print(f"     This may require: pip install onnx")
-        
-        # Fallback: save as TorchScript
-        ts_path = OUTPUT_DIR / "arabic_syntax_hrm.pt"
-        traced = torch.jit.trace(wrapper, (dummy_grid, dummy_mask))
-        traced.save(str(ts_path))
-        size_mb = os.path.getsize(ts_path) / 1e6
-        print(f"  ✅ TorchScript fallback: {ts_path} ({size_mb:.1f} MB)")
-        return size_mb
-
-
-def export_llm_gguf(model_dir: str = "models/qwen_arabic_syntax_merged"):
-    """Export fine-tuned LLM to GGUF via llama.cpp."""
-    
-    print(f"\n{'='*50}")
-    print(f"Exporting LLM to GGUF")
-    print(f"{'='*50}")
-    
-    model_path = PROJECT_ROOT / model_dir
-    if not model_path.exists():
-        print(f"  ❌ Merged model not found: {model_path}")
-        print(f"     Run scripts/05_train_llm.py first.")
+        import traceback
+        traceback.print_exc()
         return None
-    
-    # Clone llama.cpp
-    llama_dir = PROJECT_ROOT / "llama.cpp"
-    if not llama_dir.exists():
-        print("  📥 Cloning llama.cpp...")
-        subprocess.run([
-            "git", "clone", "--depth", "1",
-            "https://github.com/ggerganov/llama.cpp.git",
-            str(llama_dir)
-        ], check=True)
-    
-    # Build
-    print("  🔨 Building llama.cpp...")
-    subprocess.run(["make", "-j", "-C", str(llama_dir)], check=True)
-    
-    # Convert
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    f16_path = OUTPUT_DIR / "arabic_syntax_llm.gguf"
-    q4_path = OUTPUT_DIR / "arabic_syntax_llm_q4km.gguf"
-    
-    print("  📦 Converting to GGUF (F16)...")
-    subprocess.run([
-        "python", str(llama_dir / "convert_hf_to_gguf.py"),
-        str(model_path),
-        "--outfile", str(f16_path),
-        "--outtype", "f16"
-    ], check=True)
-    
-    print("  📦 Quantizing to Q4_K_M...")
-    subprocess.run([
-        str(llama_dir / "llama-quantize"),
-        str(f16_path), str(q4_path), "Q4_K_M"
-    ], check=True)
-    
-    f16_path.unlink(missing_ok=True)
-    
-    size_mb = os.path.getsize(q4_path) / 1e6
-    print(f"  ✅ GGUF exported: {q4_path}")
-    print(f"     Size: {size_mb:.0f} MB")
-    return size_mb
 
 
-def print_summary(hrm_size, llm_size):
-    """Print deployment size summary."""
+def verify_onnx(onnx_path: Path):
+    """Verify ONNX model output matches PyTorch."""
+    
     print(f"\n{'='*50}")
-    print(f"DEPLOYMENT SIZE SUMMARY")
+    print(f"Verifying ONNX Model")
     print(f"{'='*50}")
     
-    if hrm_size:
-        print(f"  HRM (ONNX):    {hrm_size:>8.1f} MB")
-    if llm_size:
-        print(f"  LLM (Q4_K_M):  {llm_size:>8.0f} MB")
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("  ⚠️  pip install onnxruntime to verify")
+        return
     
-    total = (hrm_size or 0) + (llm_size or 0)
-    if total > 0:
-        print(f"  {'─'*30}")
-        print(f"  Total:         {total:>8.0f} MB")
-        print(f"  Target:        < 2000 MB")
-        print(f"  Status:        {'✅ PASS' if total < 2000 else '❌ OVER BUDGET'}")
+    # Load ONNX
+    session = ort.InferenceSession(str(onnx_path))
+    
+    # Create test input
+    B, W, C, S = 1, 32, 8, 4
+    np_inputs = {
+        "word_ids": np.random.randint(1, 100, (B, W)).astype(np.int64),
+        "pos_tags": np.random.randint(1, 20, (B, W)).astype(np.int64),
+        "char_ids": np.random.randint(1, 100, (B, W, C)).astype(np.int64),
+        "bpe_ids": np.random.randint(1, 100, (B, W, S)).astype(np.int64),
+        "root_ids": np.random.randint(1, 100, (B, W)).astype(np.int64),
+        "pattern_ids": np.random.randint(1, 100, (B, W)).astype(np.int64),
+        "proclitic_ids": np.random.randint(1, 100, (B, W)).astype(np.int64),
+        "enclitic_ids": np.random.randint(1, 50, (B, W)).astype(np.int64),
+        "diac_ids": np.random.randint(0, 20, (B, W, C)).astype(np.int64),
+        "mask": np.ones((B, W), dtype=np.int64),
+    }
+    
+    # Run ONNX
+    onnx_out = session.run(None, np_inputs)
+    print(f"  ✅ ONNX Runtime inference successful")
+    print(f"     pred_heads shape: {onnx_out[0].shape}")
+    print(f"     pred_rels shape:  {onnx_out[1].shape}")
+    print(f"     pred_cases shape: {onnx_out[2].shape}")
+    
+    # Compare with PyTorch
+    config = ParserConfig(
+        word_dim=384, n_heads=6, n_transformer_layers=3,
+        n_gnn_rounds=3, n_relations=50, n_cases=4,
+    )
+    model = ArabicHRMGridParserV2(config)
+    ckpt = torch.load(CHECKPOINT_DIR / "best_model.pt", map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    
+    wrapper = HRMv2ExportWrapper(model)
+    torch_inputs = tuple(torch.from_numpy(np_inputs[name]) for name in [
+        "word_ids", "pos_tags", "char_ids", "bpe_ids",
+        "root_ids", "pattern_ids", "proclitic_ids", "enclitic_ids",
+        "diac_ids", "mask"
+    ])
+    
+    with torch.no_grad():
+        torch_out = wrapper(*torch_inputs)
+    
+    # Check match
+    match_heads = np.array_equal(onnx_out[0], torch_out[0].numpy())
+    match_rels = np.array_equal(onnx_out[1], torch_out[1].numpy())
+    match_cases = np.array_equal(onnx_out[2], torch_out[2].numpy())
+    
+    print(f"  {'✅' if match_heads else '❌'} Heads match: {match_heads}")
+    print(f"  {'✅' if match_rels else '❌'} Rels match:  {match_rels}")
+    print(f"  {'✅' if match_cases else '❌'} Cases match: {match_cases}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export models for Android")
-    parser.add_argument("--hrm-only", action="store_true",
-                         help="Only export HRM (no LLM)")
-    parser.add_argument("--hrm-dir", default="models/hrm_arabic_syntax")
-    parser.add_argument("--llm-dir", default="models/qwen_arabic_syntax_merged")
+    parser = argparse.ArgumentParser(description="Export HRM-Grid V2 to ONNX")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Path to checkpoint (default: output/hrm_v2/best_model.pt)")
+    parser.add_argument("--test", action="store_true",
+                       help="Verify ONNX output matches PyTorch")
     args = parser.parse_args()
     
-    hrm_size = export_hrm_onnx(args.hrm_dir)
+    ckpt_path = Path(args.checkpoint) if args.checkpoint else None
+    result = export_onnx(ckpt_path)
     
-    llm_size = None
-    if not args.hrm_only:
-        llm_size = export_llm_gguf(args.llm_dir)
+    if result and args.test:
+        onnx_path, _ = result
+        verify_onnx(onnx_path)
     
-    print_summary(hrm_size, llm_size)
+    if result:
+        onnx_path, size_mb = result
+        print(f"\n{'='*50}")
+        print(f"DEPLOYMENT SUMMARY")
+        print(f"{'='*50}")
+        print(f"  Model: {onnx_path}")
+        print(f"  Size:  {size_mb:.1f} MB")
+        print(f"  Target: < 200 MB")
+        print(f"  Status: {'✅ PASS' if size_mb < 200 else '⚠️  LARGE'}")
 
 
 if __name__ == "__main__":

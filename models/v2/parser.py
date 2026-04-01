@@ -110,7 +110,7 @@ class ParserConfig:
         self.n_gnn_rounds = kwargs.get('n_gnn_rounds', 3)
         self.latent_dim = kwargs.get('latent_dim', 64)
         self.n_archetypes = kwargs.get('n_archetypes', 12)
-        self.dropout = kwargs.get('dropout', 0.15)
+        self.dropout = kwargs.get('dropout', 0.33)
 
 
 class ArabicHRMGridParserV2(nn.Module):
@@ -196,7 +196,7 @@ class ArabicHRMGridParserV2(nn.Module):
         self.case_classifier = nn.Sequential(
             nn.Linear(D, D // 2),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(config.dropout),
             nn.Linear(D // 2, n_cases)
         )
         
