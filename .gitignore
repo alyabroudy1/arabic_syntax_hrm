@@ -10,6 +10,7 @@ llama.cpp/
 
 # macOS
 .DS_Store
+._*
 
 # Pytest
 .pytest_cache/
