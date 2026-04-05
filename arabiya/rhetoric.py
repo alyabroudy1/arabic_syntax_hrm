@@ -1,50 +1,40 @@
 """
-Module 5: Arabic Rhetoric & Emotion Detection from Syntax Trees
-================================================================
+Module 5: Arabic Rhetoric & Emotion Detection
+===============================================
 
-Uses dependency parse trees + case endings to detect Arabic rhetorical
-devices (أساليب بلاغية) and emotional tone. This is the NOVEL contribution:
-syntax-aware rhetoric detection for high-fidelity TTS prosody.
+Syntax-aware rhetoric analysis for high-fidelity Arabic TTS prosody.
 
-Arabic rhetorical devices detected:
+    Sources:
+      • Al-Qazwini — Device catalog (12 أساليب بلاغية)
+      • Ibn Taymiyya (مجموع الفتاوى vols 7-9) — Emphasis gradation,
+        interrogative classification, negation strength
+      • Ibn al-Qayyim (بدائع الفوائد) — Particle disambiguation,
+        conditional classification with emotional coloring
 
-  ═══ INSHAA (إنشاء) ═══
-  1. Istifham (استفهام) — Interrogative
-  2. Amr (أمر) — Command/Imperative
-  3. Nahi (نهي) — Prohibition
-  4. Nidaa (نداء) — Vocative/Address
-  5. Tamanni (تمني) — Wish
-  6. Taajjub (تعجب) — Exclamation/Wonder
+    Devices:
+      INSHAA: استفهام, أمر, نهي, نداء, تمني, تعجب
+      KHABAR: توكيد, نفي, قسم, شرط, حصر
+      BAYAAN: تشبيه
 
-  ═══ KHABAR (خبر) ═══
-  7. Tawkeed (توكيد) — Emphasis/Assertion (إنّ, قد, لام التوكيد)
-  8. Nafi (نفي) — Negation (لا, ما, لم, لن, ليس)
-  9. Qasm (قسم) — Oath (والله, تالله, بالله)
-  10. Shart (شرط) — Conditional (إن, إذا, لو, من)
-  11. Hasr (حصر) — Restriction (إنما, ما...إلا)
-
-  ═══ BAYAAN (بيان) ═══
-  12. Tashbeeh (تشبيه) — Simile (كـ, مثل, كأن)
-  13. Isti'aara (استعارة) — Metaphor detection (semantic clash)
-
-  ═══ PROSODY IMPACT ═══
-  Each device maps to specific TTS prosody adjustments:
-  - Pitch contour (rising for questions, falling for assertions)
-  - Speed (slower for oaths, faster for commands)
-  - Emphasis level (strong for tawkeed, moderate for conditional)
-  - Pause patterns (long before oath answer, short before condition result)
+    Deep Analysis (Ibn Taymiyya + Ibn al-Qayyim):
+      • 5-level emphasis gradation (قد → إنّ → إنّ+لام → قسم+لام → قسم+لام+نون)
+      • 5-way interrogative type (حقيقي / إنكاري / تقريري / تعجبي / تهكمي)
+      • 5-level negation strength (ما → لا → لم → لن → ليس)
+      • 4-way conditional type (محتمل / متوقع / امتناع / امتنان)
+      • Particle disambiguation for ما، إن، لا، قد (Ibn al-Qayyim)
 
 Usage:
-    from arabiya.rhetoric import RhetoricAnalyzer, RhetoricalDevice
+    from arabiya.rhetoric import RhetoricAnalyzer
     analyzer = RhetoricAnalyzer()
-    devices = analyzer.analyze_sentence(
-        words=["هل", "ذهب", "الطالب", "إلى", "المدرسة"],
-        pos_tags=["PART", "VERB", "NOUN", "ADP", "NOUN"],
-        relations=["mark", "root", "nsubj", "case", "obl"],
-        heads=[1, -1, 1, 4, 1],
-        case_tags=[None, None, "Nom", None, "Gen"],
+    result = analyzer.analyze_sentence(
+        words=["هل", "ذهب", "الطالب"],
+        pos_tags=["PART", "VERB", "NOUN"],
+        relations=["mark", "root", "nsubj"],
+        heads=[1, -1, 1],
+        case_tags=[None, None, "Nom"],
     )
-    # → [RhetoricalDevice(type=DeviceType.ISTIFHAM, ...)]
+    # result.devices → [RhetoricalDevice(ISTIFHAM, ...)]
+    # result.deep    → DeepAnalysisResult (emphasis, interrogative, ...)
 """
 
 from dataclasses import dataclass, field
@@ -110,19 +100,31 @@ class RhetoricalDevice:
     pause_after_ms: int = 0
 
 
+# Import Ibn Taymiyya + Ibn al-Qayyim precision layer
+from arabiya.deep_rhetoric import (
+    deep_analyze, DeepAnalysisResult,
+    EmphasisLevel, InterrogativeType, NegationStrength,
+    ConditionalType, ParticleMeaning,
+    measure_emphasis_strength, classify_interrogative,
+    classify_negation, classify_conditional,
+    disambiguate_ma, disambiguate_in, disambiguate_la, disambiguate_qad,
+)
+
+
 @dataclass
 class RhetoricResult:
     """Analysis result for a sentence."""
     devices: List[RhetoricalDevice]
     dominant_emotion: str    # neutral | emphatic | questioning | commanding | etc.
     overall_intensity: float  # 0.0 (calm) - 1.0 (intense)
+    deep: Optional[DeepAnalysisResult] = None  # Ibn Taymiyya + Ibn al-Qayyim
 
     def has_device(self, dtype: DeviceType) -> bool:
         return any(d.device_type == dtype for d in self.devices)
 
     def to_prosody_dict(self) -> Dict:
         """Convert to prosody-compatible format for TTS."""
-        return {
+        result = {
             "emotion": self.dominant_emotion,
             "intensity": self.overall_intensity,
             "devices": [
@@ -139,6 +141,9 @@ class RhetoricResult:
                 for d in self.devices
             ],
         }
+        if self.deep:
+            result["deep"] = self.deep.to_dict()
+        return result
 
 
 # ═══════════════════════════════════════════════════
@@ -320,13 +325,21 @@ class RhetoricAnalyzer:
         if d:
             devices.append(d)
 
+        # Run Ibn Taymiyya + Ibn al-Qayyim deep analysis
+        deep = deep_analyze(words, pos_tags, relations)
+
         # Determine dominant emotion and intensity
-        emotion, intensity = self._classify_emotion(devices, words)
+        emotion, intensity = self._classify_emotion(devices, words, deep)
+
+        # Use deep analysis intensity if higher
+        if deep.overall_intensity > intensity:
+            intensity = deep.overall_intensity
 
         return RhetoricResult(
             devices=devices,
             dominant_emotion=emotion,
             overall_intensity=intensity,
+            deep=deep,
         )
 
     # ─────────────────────────────────────────────
@@ -735,14 +748,59 @@ class RhetoricAnalyzer:
     # ─────────────────────────────────────────────
 
     def _classify_emotion(self, devices: List[RhetoricalDevice],
-                          words: List[str]) -> Tuple[str, float]:
-        """Classify overall emotional tone from detected devices."""
-        if not devices:
+                          words: List[str],
+                          deep: Optional[DeepAnalysisResult] = None,
+                          ) -> Tuple[str, float]:
+        """Classify overall emotional tone from detected devices.
+        
+        Enhanced with Ibn Taymiyya's intensity gradations:
+          - Emphasis level refines tawkeed intensity
+          - Interrogative type refines question emotion
+          - Negation strength refines denial intensity
+          - Conditional type adds emotional coloring
+        """
+        if not devices and (not deep or deep.emphasis.level == EmphasisLevel.NONE):
             return "neutral", 0.3
 
-        # Priority-based classification (specific > general)
         types = {d.device_type for d in devices}
 
+        # ── Use Ibn Taymiyya's deep classification when available ──
+        if deep:
+            # Interrogative sub-classification
+            if DeviceType.ISTIFHAM in types and deep.interrogative:
+                itype = deep.interrogative.q_type
+                if itype == InterrogativeType.DENIAL:
+                    return "rebuking", 0.9
+                elif itype == InterrogativeType.CONFIRMATION:
+                    return "affirming", 0.7
+                elif itype == InterrogativeType.WONDER:
+                    return "wondering", 0.85
+                elif itype == InterrogativeType.SARCASM:
+                    return "mocking", 0.8
+                # Real question falls through
+
+            # Conditional sub-classification
+            if DeviceType.SHART in types and deep.conditional:
+                ctype = deep.conditional.cond_type
+                if ctype == ConditionalType.COUNTERFACTUAL:
+                    if deep.conditional.law_subtype == 'تمني':
+                        return "longing", 0.85
+                    elif deep.conditional.law_subtype == 'برهان':
+                        return "assertive", 0.9
+                elif ctype == ConditionalType.BUT_FOR:
+                    return "grateful", 0.7
+
+            # Emphasis level upgrades tawkeed intensity
+            if DeviceType.TAWKEED in types and deep.emphasis.level != EmphasisLevel.NONE:
+                elevel = deep.emphasis.level
+                return "emphatic", elevel.intensity
+
+            # Negation strength upgrades nafi intensity
+            if DeviceType.NAFI in types and deep.negation_strength:
+                nstrength = deep.negation_strength[0]
+                return "denying", nstrength.intensity
+
+        # ── Standard priority fallback ──
         if DeviceType.QASM in types:
             return "solemn", 0.9
         if DeviceType.TAAJJUB in types:
@@ -765,5 +823,9 @@ class RhetoricAnalyzer:
             return "conditional", 0.5
         if DeviceType.TASHBEEH in types:
             return "descriptive", 0.4
+
+        # Deep analysis found emphasis but no device
+        if deep and deep.emphasis.level != EmphasisLevel.NONE:
+            return "emphatic", deep.emphasis.intensity
 
         return "neutral", 0.3
