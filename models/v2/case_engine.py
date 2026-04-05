@@ -56,8 +56,9 @@ class Case(Enum):
 class WordType(Enum):
     """Morphological word type affecting case ending realization."""
     REGULAR_SINGULAR = "regular_singular"          # مفرد عادي
-    REGULAR_SINGULAR_ALEF_MAQSURA = "alef_maq"    # ends in ى
+    REGULAR_SINGULAR_ALEF_MAQSURA = "alef_maq"    # المقصور - ends in ى
     REGULAR_SINGULAR_TAA_MARBUTA = "taa_marbuta"   # ends in ة
+    MANQUS = "manqus"                              # المنقوص - ends in ي (estimated Nom/Gen)
     SOUND_MASC_PLURAL = "sound_masc_plural"        # جمع مذكر سالم (-ون/-ين)
     SOUND_FEM_PLURAL = "sound_fem_plural"          # جمع مؤنث سالم (-ات)
     DUAL = "dual"                                  # مثنى (-ان/-ين)
@@ -112,6 +113,92 @@ def ends_with_taa_marbuta(word: str) -> bool:
 def ends_with_alef_maqsura(word: str) -> bool:
     bare = strip_diacritics(word)
     return bare.endswith('ى')
+
+
+def ends_with_yaa(word: str) -> bool:
+    """Check if word ends in ي (U+064A) — potential manqus."""
+    bare = strip_diacritics(word)
+    return bare.endswith('\u064A')
+
+
+# ─── Ibn Malik: المنقوص والمقصور والممدود ───
+# المنقوص = noun ending in ي with kasra before it
+# Case: Nom/Gen → estimated (hidden), Acc → visible fatha
+#
+# Detection signals (from PADT features):
+#   1. Construct dual (Number=Dual + Definite=Cons) → ي replaces يْن
+#   2. Active/passive participle of weak-laam roots (القاضي, الماضي)
+#   3. Lemma differs from nisba pattern
+#
+# Nisba adjectives (ـيّ) are NOT manqus — they have shadda on ي
+# and take normal case endings on the shadda.
+
+# Known manqus lemma endings (roots with weak laam)
+_MANQUS_LEMMAS = {
+    # Active participles from weak-laam roots
+    'ماضي', 'ثاني', 'قاضي', 'داعي', 'جاري', 'ساعي', 'باقي',
+    'تالي', 'عالي', 'غالي', 'حاوي', 'ناحي', 'رامي', 'ساري',
+    'هادي', 'وادي', 'آتي', 'باني', 'ناجي', 'راضي', 'حامي',
+    'ماشي', 'موالي', 'أهالي', 'معاني', 'أراضي', 'ليالي',
+    # Derived forms
+    'مبني', 'معني', 'محامي', 'مقتضي', 'منتهي', 'مستوي',
+    'مصطفي', 'متعاطي', 'متلقي', 'مستشفي',
+    # Masdar/noun forms from weak roots
+    'تعاطي', 'تلقي', 'تفادي', 'توالي', 'تراضي',
+}
+
+def is_manqus(word: str, feats: str, lemma: str = '') -> bool:
+    """Detect المنقوص per Ibn Malik.
+    
+    Returns True if the word is manqus (estimated case in Nom/Gen).
+    Manqus = noun/adj ending in ي from a weak-laam root.
+    NOT nisba adjectives (which have shadda on the ي).
+    
+    Signals:
+      1. Construct dual → ي from يْن deletion
+      2. Known manqus lemma pattern
+      3. Construct state + singular + not nisba
+    """
+    bare = strip_diacritics(word)
+    if not bare.endswith('\u064A'):  # Must end in ي
+        return False
+    
+    bare_lemma = strip_diacritics(lemma) if lemma else ''
+    
+    # 1. Construct dual: ي replaces يْن → no case on ي
+    if 'Number=Dual' in feats and 'Definite=Cons' in feats:
+        return True
+    
+    # 2. Known manqus lemma
+    if bare_lemma in _MANQUS_LEMMAS:
+        return True
+    
+    # 3. Construct state singular ending in ي where lemma ≠ form base
+    #    (possessive: وزيري lemma=وزير → ي is suffix, treat as construct)
+    if 'Definite=Cons' in feats and 'Number=Sing' not in feats:
+        # Plural/dual constructs with ي → manqus-like behavior
+        return True
+    if 'Definite=Cons' in feats:
+        # If lemma doesn't end in ي but form does → possessive suffix
+        if bare_lemma and not bare_lemma.endswith('\u064A'):
+            return True
+    
+    # 4. Pattern detection for broken plural manqus
+    #    Words like: الأهالي, الأراضي, الموالي, الليالي, التعاطي
+    #    These are broken plurals where the pattern ends in ي
+    #    Pattern: أَفَاعِي / مَوَاعِي / فَوَاعِي (مفاعل but with ي ending)
+    stem = bare[2:] if bare.startswith('ال') else bare
+    if len(stem) >= 4:
+        # If it's a broken plural ending in ي — typically manqus
+        if 'Number=Plur' in feats:
+            return True
+        # Active/passive participle patterns: فَاعِي, مُفَاعِي, مُتَفَاعِي
+        # If the letter before ي could be kasra (typical manqus indicator)
+        # and the lemma ends in ي → manqus from weak root
+        if bare_lemma and bare_lemma.endswith('\\u064A') and bare_lemma.endswith('\\u0649'):
+            return True
+    
+    return False
 
 
 def has_definite_article(word: str) -> bool:
@@ -346,14 +433,50 @@ class CaseEndingRuleEngine:
         
         # Pronouns — mostly indeclinable
         if upos == 'PRON':
-            # Relative pronouns and demonstratives are indeclinable
-            if 'PronType=Rel' in feats or 'PronType=Dem' in feats:
-                return WordType.INDECLINABLE
             return WordType.INDECLINABLE  # most pronouns are مبني
+        
+        # Relative pronouns (الذي/التي) — indeclinable even if tagged as other POS
+        if 'PronType=Rel' in feats:
+            return WordType.INDECLINABLE
         
         # Five nouns check
         if is_five_nouns(word, lemma):
             return WordType.FIVE_NOUNS
+        
+        # ══ المقصور (Alef maqsura) — Ibn Malik ══
+        # Case endings are ALWAYS estimated (تعذّر) — alif cannot bear vowel.
+        # Covers: ى ending AND ا ending when it's a maqsur plural
+        # Examples: الفتى, أخرى, قتلى, ضحايا, قضايا
+        #
+        # EXCEPTION: Nisba adjectives written with ى instead of ي (Egyptian orthography)
+        # e.g., الامريكى (lemma=أمريكي) — these are NOT maqsur, they take normal case.
+        # Detection: if lemma ends in ي (U+064A), the ى is actually a dotless yaa.
+        if ends_with_alef_maqsura(word):
+            bare_lemma = strip_diacritics(lemma) if lemma else ''
+            # If lemma ends in ي → this is a nisba/regular word, NOT maqsur
+            if bare_lemma and bare_lemma.endswith('\u064A'):
+                pass  # Fall through to regular/nisba handling below
+            else:
+                return WordType.REGULAR_SINGULAR_ALEF_MAQSURA
+        
+        # Also: words ending in ا (alef) that are broken plurals with estimated case
+        # Pattern: فعايا/فعالا (like ضحايا, قضايا)
+        # BUT NOT tanween-fath+alef (مجالًا) which is regular Acc indefinite!
+        bare = strip_diacritics(word)
+        if bare.endswith('\u0627') and len(bare) > 2:  # ends in alef
+            stem = bare[2:] if bare.startswith('ال') else bare
+            # Broken plurals ending in ا with pattern CاCيا or similar
+            if stem.endswith('ايا'):
+                return WordType.REGULAR_SINGULAR_ALEF_MAQSURA
+            # BUT: single alef after consonant is NOT maqsur if it could be 
+            # tanween fath + alef (كتابًا). Only count if it's a genuine maqsur plural.
+        
+        # ══ المنقوص (Manqus) — Ibn Malik ══
+        # Nom/Gen: estimated (hidden), Acc: visible fatha (unless construct)
+        # Also catches broken plural manqus: الأهالي, الأراضي, الموالي
+        if ends_with_yaa(word) and upos in ('NOUN', 'ADJ', 'PROPN', 'NUM'):
+            if is_manqus(word, feats, lemma):
+                return WordType.MANQUS
         
         # Dual
         if is_dual(word, feats):
@@ -391,10 +514,6 @@ class CaseEndingRuleEngine:
         # Taa marbuta ending
         if ends_with_taa_marbuta(word):
             return WordType.REGULAR_SINGULAR_TAA_MARBUTA
-        
-        # Alef maqsura ending (indeclinable for case-marking purposes)
-        if ends_with_alef_maqsura(word):
-            return WordType.REGULAR_SINGULAR_ALEF_MAQSURA
         
         # Default: regular singular
         if upos in ('NOUN', 'ADJ', 'PROPN', 'NUM', 'ADV'):
@@ -449,11 +568,41 @@ class CaseEndingRuleEngine:
         
         # ══ ALEF MAQSURA (ـى) ══
         # Case is estimated (hidden) — no visible change
+        # ══ المقصور (ـى) ══
         if word_type == WordType.REGULAR_SINGULAR_ALEF_MAQSURA:
             return CaseEndingResult(
                 word=word, case=case, word_type=word_type.value,
                 ending_diacritic="", ending_description_ar="اسم مقصور - إعراب تقديري",
-                is_definite=definite, has_tanween=False, confidence=0.8
+                is_definite=definite, has_tanween=False, confidence=0.95
+            )
+        
+        # ══ المنقوص (ـي) — Ibn Malik ══
+        # Nom/Gen: estimated (hidden) — no visible diacritic
+        # Acc: visible fatha (or fathatan if indefinite)
+        if word_type == WordType.MANQUS:
+            # In construct state with possessive suffix, ي IS the suffix
+            # → no case diacritic on it (case is on the base word)
+            if construct:
+                return CaseEndingResult(
+                    word=word, case=case, word_type=word_type.value,
+                    ending_diacritic="",
+                    ending_description_ar="مضاف - الإعراب على المضاف إليه",
+                    is_definite=definite, has_tanween=False, confidence=0.9
+                )
+            if case == "Acc":
+                needs_tanween = not definite
+                diac = TANWEEN_F if needs_tanween else FATHA
+                desc = "منصوب بفتحة ظاهرة على الياء" + (" المنونة" if needs_tanween else "")
+            else:
+                diac = ""
+                if case == "Nom":
+                    desc = "مرفوع بضمة مقدرة على الياء للثقل"
+                else:
+                    desc = "مجرور بكسرة مقدرة على الياء للثقل"
+            return CaseEndingResult(
+                word=word, case=case, word_type=word_type.value,
+                ending_diacritic=diac, ending_description_ar=desc,
+                is_definite=definite, has_tanween=False, confidence=0.9
             )
         
         # ══ FIVE NOUNS (الأسماء الخمسة) ══
