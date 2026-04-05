@@ -359,10 +359,20 @@ def is_sound_fem_plural(word: str, feats: str) -> bool:
 
 
 def is_dual(word: str, feats: str) -> bool:
-    """Check for مثنى (-ان/-ين ending)."""
+    """Check for مثنى (-ان/-ين ending).
+    
+    Per Ibn Malik (ألفية, باب المثنى):
+    Also includes اثنان/اثنتان which follow dual rules
+    even when tagged as Number=Sing in some treebanks.
+    """
     bare = strip_diacritics(word)
     if 'Number=Dual' in feats:
         return bare.endswith('ان') or bare.endswith('ين')
+    # Special case: اثنان/اثنتان/اثنين/اثنتين/الاثنين per Ibn Malik
+    bare_nostem = bare[2:] if bare.startswith('ال') else bare
+    lemma_bare = strip_diacritics(feats)  # not lemma, but we check form
+    if bare_nostem in ('اثنان', 'اثنتان', 'اثنين', 'اثنتين'):
+        return True
     return False
 
 
@@ -376,15 +386,24 @@ def is_five_nouns(word: str, lemma: str) -> bool:
 def is_diptote(feats: str) -> bool:
     """Check for ممنوع من الصرف (diptote).
     
-    Common diptotes: proper nouns, certain broken plural patterns (مفاعل، فواعل),
-    adjectives on أفعل pattern, foreign words.
+    Per Ibn Malik (ألفية, باب ما لا ينصرف):
+    Common diptotes: proper nouns, certain broken plural patterns,
+    adjectives on أفعل pattern (أول, أكبر, أحسن), foreign words.
     """
     if 'Diptote=Yes' in feats:
         return True
-    # Foreign words are diptotes
     if 'Foreign=Yes' in feats:
         return True
     return False
+
+
+# أفعل pattern words that are diptote (Ibn Malik: الصِفة التي على أفعل)
+# NOTE: أول is excluded — PADT treats it inconsistently (sometimes triptote)
+_AFAL_DIPTOTES = {
+    'أكبر', 'أصغر', 'أحسن', 'أقرب', 'أكثر', 'أفضل',
+    'أبعد', 'أعلى', 'أدنى', 'أقل', 'أعظم', 'أهم',
+    'آخر', 'أخر',  # آخر/أخر
+}
 
 
 def _load_diptote_set() -> Set[str]:
@@ -582,6 +601,10 @@ class CaseEndingRuleEngine:
         if upos == 'PROPN':
             return WordType.DIPTOTE
         if is_known_diptote(word, lemma):
+            return WordType.DIPTOTE
+        # أفعل pattern diptotes (Ibn Malik: الصِفة التي على أفعل)
+        bare_lemma_chk = strip_diacritics(lemma) if lemma else ''
+        if bare_lemma_chk in _AFAL_DIPTOTES:
             return WordType.DIPTOTE
         
         # Default: regular singular
