@@ -239,12 +239,15 @@ def has_definite_article(word: str) -> bool:
     return bare.startswith('ال') or bare.startswith('ٱل')
 
 
-def is_sound_masc_plural(word: str, feats: str) -> bool:
+def is_sound_masc_plural(word: str, feats: str, lemma: str = '') -> bool:
     """Check for جمع مذكر سالم (-ون/-ين ending).
     
-    Detects SMP even when Gender=Masc is missing from features.
-    Key distinction: SMP adds -ون/-ين to a SINGULAR STEM of 3+ letters.
-    فعول plurals (شؤون, عيون, ديون) have ون as part of the pattern, not a suffix.
+    Per Ibn Malik (ألفية, باب جمع المذكر السالم):
+    SMP adds -ون/-ين to a SINGULAR STEM of 3+ letters.
+    
+    NOT مفاعيل broken plurals:
+      ملايين (مليون), القوانين (قانون), الموازين (ميزان)
+      These match مفاعيل pattern and take TRIPTOTE endings.
     """
     bare = strip_diacritics(word)
     if bare.startswith('ال'):
@@ -257,16 +260,28 @@ def is_sound_masc_plural(word: str, feats: str) -> bool:
     
     # Must end in ون or ين
     if not (stem.endswith('ون') or stem.endswith('ين')):
-        # Handle construct state: مواطنو (ون minus final noon)
+        # Handle construct state: مواطنو/مرشحو (ون minus final noon)
         if stem.endswith('و') and 'Definite=Cons' in feats:
             base = stem[:-1]
             return len(base) >= 3
         return False
     
     # The singular stem (before ون/ين) must be at least 3 characters
-    # This prevents فعول patterns like شؤون (stem شؤ = 2 chars) from matching
     base = stem[:-2]
     if len(base) < 3:
+        return False
+    
+    # ═══ Ibn Malik: exclude مفاعيل broken plurals ═══
+    # Per الألفية: وَكُلُّ جَمْعٍ مُشَبَّهٌ مَفَاعِلاَ أَوِ الْمَفَاعِيلَ بِمَنْعٍ كَافِلاَ
+    # مفاعيل plurals end in -ين but it's PART OF THE PATTERN, not a suffix.
+    #
+    # BUT: nisba SMP is genuine: دبلوماسي+ون = دبلوماسيون (SMP)
+    # Key distinction: if lemma ends in ي → nisba SMP; if lemma ends in ون/ان → مفاعيل
+    bare_lemma = strip_diacritics(lemma) if lemma else ''
+    
+    # Check: lemma ends in ون/ان → singular is فعلون/فعلان, plural is مفاعيل
+    if bare_lemma and (bare_lemma.endswith('ون') or bare_lemma.endswith('ان')):
+        # e.g., مليون→ملايين, قانون→قوانين, ميزان→موازين, بستان→بساتين
         return False
     
     return True
@@ -546,7 +561,7 @@ class CaseEndingRuleEngine:
             return WordType.REGULAR_SINGULAR_TAA_MARBUTA
         
         # Sound masculine plural
-        if is_sound_masc_plural(word, feats):
+        if is_sound_masc_plural(word, feats, lemma):
             return WordType.SOUND_MASC_PLURAL
         
         # Sound feminine plural
