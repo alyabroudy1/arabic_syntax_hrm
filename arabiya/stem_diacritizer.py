@@ -56,6 +56,23 @@ class StemDiacritizer:
             self._fallback[bare_word] = diacritized
 
     def lookup(self, bare_word: str, pos: str = '') -> Optional[str]:
+        # Direct lookup
+        hit = self._direct_lookup(bare_word, pos)
+        if hit:
+            return hit
+
+        # Fallback: strip ال and re-lookup, then re-attach
+        if bare_word.startswith('ال') and len(bare_word) > 2:
+            stem = bare_word[2:]
+            stem_hit = self._direct_lookup(stem, pos)
+            if stem_hit:
+                # Re-attach ال — but the diacritized stem may start with
+                # shadda (sun letters like الشَّمْس) or sukun (moon letters)
+                return 'ال' + stem_hit
+
+        return None
+
+    def _direct_lookup(self, bare_word: str, pos: str) -> Optional[str]:
         if bare_word in self._lexicon:
             pos_map = self._lexicon[bare_word]
             if pos in pos_map:
