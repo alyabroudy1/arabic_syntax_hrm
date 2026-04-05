@@ -1,0 +1,67 @@
+{
+  "input": "إن العلم نور",
+  "diacritized": "إِنَّ الْعِلْمَ نُورٌ",
+  "emotion": "assertive",
+  "style": {
+    "speed": 0.95,
+    "pitch": 1.05,
+    "energy": 0.9
+  },
+  "kokoro_text": "إِنَّ الْعِلْمَ نُورٌ .",
+  "pipeline_stages": [
+    "diacritization",
+    "rhetoric",
+    "prosody"
+  ],
+  "segments": [
+    {
+      "word": "إِنَّ",
+      "speed_factor": 0.874,
+      "pause_after_ms": 0,
+      "emphasis": "moderate",
+      "prosody_tags": []
+    },
+    {
+      "word": "الْعِلْمَ",
+      "speed_factor": 0.76,
+      "pause_after_ms": 0,
+      "emphasis": "slight",
+      "prosody_tags": [
+        "مد عارض للسكون",
+        "لام قمرية"
+      ]
+    },
+    {
+      "word": "نُورٌ",
+      "speed_factor": 0.95,
+      "pause_after_ms": 400,
+      "emphasis": "none",
+      "prosody_tags": []
+    }
+  ],
+  "rhetoric": {
+    "emotion": "emphatic",
+    "intensity": 0.6,
+    "devices": [
+      {
+        "type": "توكيد",
+        "trigger": "إن",
+        "idx": 0,
+        "pitch": "peak",
+        "speed": 0.9,
+        "emphasis": "strong",
+        "pause_before": 150,
+        "pause_after": 0
+      }
+    ],
+    "deep": {
+      "emphasis": {
+        "level": "توكيد_متوسط",
+        "intensity": 0.3,
+        "markers": [
+          "إنّ_التوكيدية"
+        ]
+      }
+    }
+  }
+}
