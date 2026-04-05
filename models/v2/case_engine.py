@@ -20,8 +20,10 @@ Case mapping:
 """
 
 import re
+import json
+import os
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 from enum import Enum
 
 # ═══════════════════════════════════════════════════
@@ -163,33 +165,40 @@ def is_diptote(feats: str) -> bool:
     return False
 
 
-def is_broken_plural_diptote(word: str, feats: str) -> bool:
-    """Most Arabic broken plural patterns are diptotes (ممنوع من الصرف).
-    
-    Diptote broken plural patterns include:
-    - مَفَاعِل (مساجد, مكاتب)
-    - مَفَاعِيل (مفاتيح, مصابيح)
-    - فَوَاعِل (شوارع, جوامع)
-    - أَفَاعِل (أصابع, أنابيب) 
-    - فَعَائِل (حقائب, رسائل)
-    - أَفَاعِيل (أناشيد, أساليب)
-    - تَفَاعِل (تجارب, تفاصيل)
-    - تَفَاعِيل (تماثيل)
-    
-    Triptote (normal) broken plurals:
-    - أَفْعَال (أعمال, أقوال) 
-    - فُعُول (دروس, شروط)
-    - فِعَال (رجال, جبال)
-    - فُعَل (غرف, دول)
-    
-    Since we can't always determine the pattern from surface form,
-    broken plurals are treated as DIPTOTE by default unless we can
-    confirm they're triptote. This errs on the side of no-tanween
-    and fatha-in-genitive, which is correct for the majority.
-    """
-    # If explicitly definite, the diptote/triptote distinction doesn't matter
-    # for case endings (both use kasra with ال)
-    return True  # Default: treat broken plurals as diptotes
+def _load_diptote_set() -> Set[str]:
+    """Load PADT-extracted diptote word list (surface forms + lemmas)."""
+    diptote_set = set()
+    # Try multiple possible locations
+    candidates = [
+        os.path.join(os.path.dirname(__file__), '..', '..', 'arabiya', 'data', 'diptotes.json'),
+        os.path.join(os.path.dirname(__file__), '..', 'arabiya', 'data', 'diptotes.json'),
+    ]
+    for path in candidates:
+        path = os.path.normpath(path)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                diptote_set.update(data.get('words', []))
+                diptote_set.update(data.get('lemmas', []))
+                return diptote_set
+            except Exception:
+                pass
+    return diptote_set
+
+
+# Load once at module level
+_DIPTOTE_SET = _load_diptote_set()
+
+
+def is_known_diptote(word: str, lemma: str = '') -> bool:
+    """Check if word or lemma is in the PADT-extracted diptote list."""
+    bare = strip_diacritics(word)
+    if bare in _DIPTOTE_SET:
+        return True
+    if lemma and strip_diacritics(lemma) in _DIPTOTE_SET:
+        return True
+    return False
 
 
 def is_construct_state(deprel: str, feats: str) -> bool:
@@ -270,18 +279,22 @@ class CaseEndingRuleEngine:
         if is_sound_fem_plural(word, feats):
             return WordType.SOUND_FEM_PLURAL
         
-        # Broken plural — most are diptotes (ممنوع من الصرف)
+        # Broken plural — check diptote list or default to diptote
         if 'Number=Plur' in feats and upos in ('NOUN', 'ADJ'):
-            # If not SMP or SFP, it's a broken plural
-            # Most broken plural patterns are diptotes
-            if is_broken_plural_diptote(word, feats):
+            # If in the extracted diptote list, definitely diptote
+            if is_known_diptote(word, lemma):
                 return WordType.DIPTOTE
-            return WordType.BROKEN_PLURAL
+            # Most broken plural patterns ARE diptotes
+            # Default to diptote (correct for majority)
+            return WordType.DIPTOTE
         
-        # Diptote — explicit mark OR proper nouns (most are diptotes)
+        # Diptote — explicit mark, proper nouns, or in PADT diptote list
         if is_diptote(feats):
             return WordType.DIPTOTE
         if upos == 'PROPN':
+            return WordType.DIPTOTE
+        # Check PADT-extracted diptote set for regular nouns/adjs
+        if is_known_diptote(word, lemma):
             return WordType.DIPTOTE
         
         # Taa marbuta ending
