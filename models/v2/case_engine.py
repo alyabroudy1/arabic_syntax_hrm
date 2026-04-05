@@ -121,10 +121,98 @@ def has_definite_article(word: str) -> bool:
 
 
 def is_sound_masc_plural(word: str, feats: str) -> bool:
-    """Check for جمع مذكر سالم (-ون/-ين ending)."""
+    """Check for جمع مذكر سالم (-ون/-ين ending).
+    
+    Detects SMP even when Gender=Masc is missing from features.
+    Key distinction: SMP adds -ون/-ين to a SINGULAR STEM of 3+ letters.
+    فعول plurals (شؤون, عيون, ديون) have ون as part of the pattern, not a suffix.
+    """
     bare = strip_diacritics(word)
-    if 'Number=Plur' in feats and 'Gender=Masc' in feats:
-        return bare.endswith('ون') or bare.endswith('ين')
+    if bare.startswith('ال'):
+        stem = bare[2:]
+    else:
+        stem = bare
+    
+    if 'Number=Plur' not in feats:
+        return False
+    
+    # Must end in ون or ين
+    if not (stem.endswith('ون') or stem.endswith('ين')):
+        # Handle construct state: مواطنو (ون minus final noon)
+        if stem.endswith('و') and 'Definite=Cons' in feats:
+            base = stem[:-1]
+            return len(base) >= 3
+        return False
+    
+    # The singular stem (before ون/ين) must be at least 3 characters
+    # This prevents فعول patterns like شؤون (stem شؤ = 2 chars) from matching
+    base = stem[:-2]
+    if len(base) < 3:
+        return False
+    
+    return True
+
+
+# ─── Ibn Malik's صيغة منتهى الجموع ───
+# Per Alfiyyat Ibn Malik:
+#   وَكُلُّ جَمْعٍ مُشَبَّهٌ مَفَاعِلاَ أَوِ الْمَفَاعِيلَ بِمَنْعٍ كَافِلاَ
+#
+# Diptote broken plurals are EXACTLY those matching:
+#   1. مَفَاعِل pattern: alef after letter 2, then 2 consonants (e.g., مساجد, قوالب, فواعل)
+#   2. مَفَاعِيل pattern: alef after letter 2, then 3 letters with ي/و (e.g., مصابيح, أساليب)
+# ALL other broken plurals are TRIPTOTE (take kasra/tanween normally).
+
+def is_diptote_plural_pattern(word: str, lemma: str = '') -> bool:
+    """Detect صيغة منتهى الجموع (Ibn Malik's diptote plural patterns).
+    
+    A broken plural is diptote IFF:
+      - Pattern has ألف ساكنة after the 2nd radical
+      - Followed by 2 consonants (مفاعل) or 3 with middle ي/و (مفاعيل)
+    
+    Examples of DIPTOTE plurals:
+      مساجد, مكاتب, مدارس, فواعل, قوالب     (مفاعل)
+      مصابيح, أساليب, مفاتيح, تماثيل          (مفاعيل)
+    
+    Examples of TRIPTOTE plurals (NOT this pattern):
+      أسباب, أعمال, أقوال     (أفعال)
+      دروس, شروط, جهود       (فعول)
+      رجال, جبال              (فعال)
+      غرف, دول, صور           (فعل)
+      كتب, رسل               (فعل)
+    """
+    bare = strip_diacritics(word)
+    if bare.startswith('ال'):
+        bare = bare[2:]
+    
+    n = len(bare)
+    if n < 4:
+        return False  # Too short for منتهى الجموع
+    
+    # Look for ا (alef) at position 2 (3rd character, 0-indexed)
+    # This captures: مَ-فَ-ا-عِ-ل, فَ-وَ-ا-عِ-ل, etc.
+    # Position 2 means after the first two radicals
+    
+    # مفاعل pattern: 5 letters, alef at position 2
+    # Examples: مساجد(مسأجد→5), قوالب(5), مدارس(5), فواعل(5)
+    if n == 5 and bare[2] in ('ا', 'آ'):
+        return True
+    
+    # مفاعيل pattern: 6+ letters, alef at position 2, then ي/و before last letter
+    # Examples: مصابيح(6), أساليب(6), تماثيل(6), مفاتيح(6)
+    if n == 6 and bare[2] in ('ا', 'آ') and bare[4] in ('ي', 'و'):
+        return True
+    
+    # Also: 5 letters with alef at position 3 (فعالل, فعاليل)
+    # Examples: دنانير(6), سراويل(6), عصافير(6)
+    if n == 6 and bare[3] in ('ا', 'آ') and bare[4] in ('ي', 'و'):
+        return True
+    if n == 6 and bare[2] in ('ا', 'آ'):
+        return True  # 6-letter with alef at 2
+    
+    # 7+ letters: extended patterns like تفاعيل, مستفاعل
+    if n >= 7 and bare[2] in ('ا', 'آ'):
+        return True
+    
     return False
 
 
@@ -279,14 +367,17 @@ class CaseEndingRuleEngine:
         if is_sound_fem_plural(word, feats):
             return WordType.SOUND_FEM_PLURAL
         
-        # Broken plural — check diptote list or default to diptote
+        # Broken plural — Ibn Malik's صيغة منتهى الجموع rule
+        # Diptote = مفاعل/مفاعيل patterns; everything else = triptote
         if 'Number=Plur' in feats and upos in ('NOUN', 'ADJ'):
-            # If in the extracted diptote list, definitely diptote
+            # Check if it's a known diptote from PADT list
             if is_known_diptote(word, lemma):
                 return WordType.DIPTOTE
-            # Most broken plural patterns ARE diptotes
-            # Default to diptote (correct for majority)
-            return WordType.DIPTOTE
+            # Check Ibn Malik's مفاعل/مفاعيل pattern
+            if is_diptote_plural_pattern(word, lemma):
+                return WordType.DIPTOTE
+            # All other broken plurals are TRIPTOTE (normal endings)
+            return WordType.BROKEN_PLURAL
         
         # Diptote — explicit mark, proper nouns, or in PADT diptote list
         if is_diptote(feats):
