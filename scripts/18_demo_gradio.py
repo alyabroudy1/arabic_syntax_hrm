@@ -12,7 +12,7 @@ Interactive Gradio demo showcasing:
 Sources: Ibn Malik · Ibn Taymiyya · Ibn al-Qayyim · Al-Qazwini
 """
 
-import sys, io, json, os
+import sys, io, json, os, asyncio, tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -32,12 +32,55 @@ from arabiya.deep_rhetoric import (
 )
 from arabiya.tts_pipeline import ArabiyaTTSPipeline, TTSResult
 
+# Edge TTS for audio preview
+try:
+    import edge_tts
+    HAS_EDGE_TTS = True
+except ImportError:
+    HAS_EDGE_TTS = False
+
 # ══════════════════════════════════════════════════════
 # Initialize
 # ══════════════════════════════════════════════════════
 
 pipeline = ArabiyaTTSPipeline.create_mock()
 rhetoric_analyzer = RhetoricAnalyzer()
+
+# TTS output directory
+TTS_DIR = PROJECT_ROOT / "output" / "tts_cache"
+TTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Edge TTS voice mapping per emotion
+TTS_VOICES = {
+    "neutral":     ("ar-SA-ZariyahNeural", "+0%", "+0Hz"),
+    "assertive":   ("ar-SA-HamedNeural",   "-5%", "+2Hz"),
+    "questioning":  ("ar-SA-ZariyahNeural", "+0%", "+5Hz"),
+    "reverent":    ("ar-SA-HamedNeural",   "-15%", "-3Hz"),
+    "joyful":      ("ar-SA-ZariyahNeural", "+10%", "+3Hz"),
+    "sad":         ("ar-SA-HamedNeural",   "-10%", "-5Hz"),
+}
+
+async def _synthesize_edge(text: str, emotion: str) -> str:
+    """Synthesize Arabic speech with Edge TTS, emotion-aware."""
+    voice, rate, pitch = TTS_VOICES.get(emotion, TTS_VOICES["neutral"])
+    output_path = str(TTS_DIR / f"tts_{hash(text + emotion) & 0xFFFFFFFF:08x}.mp3")
+    
+    if os.path.exists(output_path):
+        return output_path
+    
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+    await communicate.save(output_path)
+    return output_path
+
+def synthesize_audio(text: str, emotion: str = "neutral") -> str:
+    """Sync wrapper for Edge TTS."""
+    if not HAS_EDGE_TTS or not text.strip():
+        return None
+    try:
+        return asyncio.run(_synthesize_edge(text, emotion))
+    except Exception as e:
+        print(f"[TTS Error] {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════
@@ -46,7 +89,7 @@ rhetoric_analyzer = RhetoricAnalyzer()
 
 def run_pipeline(text):
     if not text.strip():
-        return "", "", "", "", ""
+        return "", "", "", "", "", None
     
     result = pipeline.process(text)
     
@@ -100,7 +143,10 @@ def run_pipeline(text):
     # JSON output
     json_out = result.to_json()
     
-    return diac, emotion_display, prosody_md, devices_md, json_out
+    # Audio synthesis (Edge TTS with emotion-aware voice)
+    audio_path = synthesize_audio(result.diacritized, result.emotion)
+    
+    return diac, emotion_display, prosody_md, devices_md, json_out, audio_path
 
 
 # ══════════════════════════════════════════════════════
@@ -457,6 +503,13 @@ def build_demo():
                     )
                     emotion_out = gr.Markdown(label="🎭 العاطفة")
                 
+                # Audio player
+                audio_out = gr.Audio(
+                    label="🔊 استمع — Edge TTS Preview",
+                    type="filepath",
+                    autoplay=True,
+                )
+                
                 with gr.Row():
                     with gr.Column():
                         prosody_out = gr.Markdown(label="🔊 خطة النبر (Prosody)")
@@ -468,7 +521,7 @@ def build_demo():
                 
                 btn_run.click(
                     run_pipeline, inputs=[txt_input],
-                    outputs=[diac_out, emotion_out, prosody_out, rhetoric_out, json_out],
+                    outputs=[diac_out, emotion_out, prosody_out, rhetoric_out, json_out, audio_out],
                 )
             
             # ═══ Tab 2: Case Inspector ═══
